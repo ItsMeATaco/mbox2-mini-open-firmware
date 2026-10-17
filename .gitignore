@@ -26,6 +26,7 @@
 !/tools/firmware/
 !/tools/asio/
 !/tools/setup/
+!/tools/release/
 /tools/firmware/*
 !/tools/firmware/build.ps1
 !/tools/firmware/usbeeprom.py

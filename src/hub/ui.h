@@ -44,6 +44,7 @@ struct UiModel {
   int status_kind = 0;   // 0 neutral, 1 good (accent dot), 2 attention (amber dot)
   std::wstring rate;     // second pill: the Mbox's sample rate; empty hides it
   int rate_kind = 0;     // 0 neutral, 2 attention (Windows' playback and recording rates differ)
+  std::wstring update;   // pill offering a new release from GitHub; empty hides it
   bool side_open = false;       // the settings cog's side column: firmware, dropout log, DAW, startup
   bool side_attention = false;  // something there needs a look (amber dot on the cog while it's closed)
   MeterView meters[4];   // In 1, In 2, Out 1, Out 2
@@ -82,6 +83,9 @@ struct UiModel {
 
   // DAW (ASIO) card
   std::wstring daw_badge;            // "Installed", "Not installed", ...
+  std::wstring daw_action;           // a button in the badge's place: "Install", "Update", "Repair"
+  bool daw_action_enabled = true;    // false while an install runs
+  bool daw_remove = false;           // a Remove button at the end of the installed driver's path
   std::wstring daw_path;             // the driver's DLL, or how to install it
   bool daw_path_attention = false;
   int daw_buffer = -1;               // the driver's preferred size, as an index into kDriverBufferChoices; -1 none
@@ -118,6 +122,9 @@ enum class Hit {
   Smoothing6,
   Smoothing3,
   Settings,  // the cog: shows or hides the side column
+  Update,    // the header's update pill
+  DawAction,
+  DawRemove,
   Count
 };
 
@@ -170,6 +177,9 @@ class Ui {
   void Toggle(D2D1_RECT_F rect, bool on, bool hover);
   void Gear(float cx, float cy, UINT32 color, UINT32 hole);
   void Button(D2D1_RECT_F rect, const std::wstring& text, bool hover, bool enabled = true, bool primary = false);
+  // A compact button ending at `right` (like "Open log"); returns its rectangle.
+  D2D1_RECT_F SmallButton(float right, float top, const std::wstring& text, bool hover, bool primary = false,
+                          bool enabled = true, float height = 28.0f);
   void Meter(float x, float top, float bar_height, const MeterView& meter, const wchar_t* label, bool live);
   void Card(D2D1_RECT_F rect);
   void SetHit(Hit hit, D2D1_RECT_F rect) { hit_[static_cast<int>(hit)] = rect; }

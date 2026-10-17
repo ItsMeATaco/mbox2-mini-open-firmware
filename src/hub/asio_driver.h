@@ -25,6 +25,15 @@ struct AsioDriver {
 
 AsioDriver FindAsioDriver();
 
+// Where the driver is installed: %ProgramFiles%\Mbox2Asio\mbox2asio.dll, so updating the hub never touches the
+// copy a DAW has loaded.
+std::wstring AsioInstallPath();
+// Copy `dll` there and register it (regsvr32), or unregister and delete it. Both need administrator rights:
+// the hub runs them in an elevated copy of itself (mbox2hub.exe --install-asio DLL / --uninstall-asio). They
+// return an empty string on success, else what went wrong.
+std::string InstallAsioDriver(const std::wstring& dll);
+std::string UninstallAsioDriver();
+
 // The size the driver reports as preferred in getBufferSize(): HKCU\Software\Mbox2Asio BufferFrames, clamped
 // and rounded as the driver does, or its default (192) without the value. `set`: whether the value exists.
 int ReadDriverBuffer(bool* set = nullptr);

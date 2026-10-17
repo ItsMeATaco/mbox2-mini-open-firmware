@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <iterator>
 #include <stdexcept>
 
 namespace {
@@ -75,11 +76,17 @@ std::string LoadFirmwareImage(const std::wstring& path, FirmwareImage* image) {
   if (h.eeprom_type != 0x0A || h.data_type != 0x01) {
     return Format("not an application image for a 24C64 (types %02X %02X)", h.eeprom_type, h.data_type);
   }
-  if (h.size == 0 || kHeaderSize + h.size != static_cast<int>(n)) {
+  // A whole-chip backup (pi/flash.sh saves all 8 KB) carries the chip's unused rest after the image: only the
+  // image itself is written back.
+  if (h.size == 0 || kHeaderSize + h.size > static_cast<int>(n)) {
     return Format("the header says %u bytes of code, the file has %u", h.size, static_cast<unsigned>(n - kHeaderSize));
   }
+  bytes.resize(kHeaderSize + h.size);
   uint16_t sum = Sum(bytes.data() + kHeaderSize, h.size);
   if (sum != h.checksum) return Format("checksum mismatch (header %04X, data %04X)", h.checksum, sum);
+  // Avid's device descriptor: vendor 0DBA, product 3000.
+  static constexpr uint8_t kAvidIds[] = {0xBA, 0x0D, 0x00, 0x30};
+  image->avid = std::search(bytes.begin(), bytes.end(), std::begin(kAvidIds), std::end(kAvidIds)) != bytes.end();
   image->bytes = std::move(bytes);
   image->version = h.version;
   image->size = h.size;

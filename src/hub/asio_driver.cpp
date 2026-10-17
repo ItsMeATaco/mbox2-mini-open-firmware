@@ -152,6 +152,106 @@ bool WriteDriverBuffer(int frames) {
          ERROR_SUCCESS;
 }
 
+std::wstring AsioInstallPath() {
+  PWSTR base = nullptr;
+  std::wstring path;
+  if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramFiles, 0, nullptr, &base))) {
+    path = std::wstring(base) + L"\\Mbox2Asio\\mbox2asio.dll";
+  }
+  CoTaskMemFree(base);
+  return path;
+}
+
+namespace {
+
+// Runs regsvr32 silently on `dll` (`unregister`: /u) and returns its exit code, or -1 if it didn't start.
+long Regsvr32(const std::wstring& dll, bool unregister) {
+  wchar_t system[MAX_PATH] = {};
+  GetSystemDirectoryW(system, MAX_PATH);
+  const std::wstring exe = std::wstring(system) + L"\\regsvr32.exe";
+  std::wstring command = L"\"" + exe + L"\" /s " + (unregister ? L"/u " : L"") + L"\"" + dll + L"\"";
+  STARTUPINFOW startup{sizeof startup};
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+                      &startup, &process)) {
+    return -1;
+  }
+  WaitForSingleObject(process.hProcess, 30000);
+  DWORD code = static_cast<DWORD>(-1);
+  GetExitCodeProcess(process.hProcess, &code);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  return static_cast<long>(code);
+}
+
+std::string Failed(const char* what, DWORD code) {
+  char text[128];
+  snprintf(text, sizeof text, "%s (error %lu)", what, code);
+  return text;
+}
+
+// Copies a DAW still had loaded were renamed aside (mbox2asio.dll.old-*); deletes the ones that are free now.
+void DeleteOldCopies(const std::wstring& folder, bool after_restart) {
+  WIN32_FIND_DATAW found;
+  HANDLE search = FindFirstFileW((folder + L"\\mbox2asio.dll.old-*").c_str(), &found);
+  if (search == INVALID_HANDLE_VALUE) return;
+  do {
+    const std::wstring path = folder + L"\\" + found.cFileName;
+    if (!DeleteFileW(path.c_str()) && after_restart) MoveFileExW(path.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+  } while (FindNextFileW(search, &found));
+  FindClose(search);
+}
+
+}  // namespace
+
+std::string InstallAsioDriver(const std::wstring& dll) {
+  const std::wstring target = AsioInstallPath();
+  if (target.empty()) return "Program Files wasn't found";
+  if (GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES) return "mbox2asio.dll isn't next to the hub";
+  const std::wstring folder = target.substr(0, target.find_last_of(L'\\'));
+  CreateDirectoryW(folder.c_str(), nullptr);
+  DeleteOldCopies(folder, false);
+  if (CompareStringOrdinal(dll.c_str(), -1, target.c_str(), -1, TRUE) != CSTR_EQUAL &&
+      !CopyFileW(dll.c_str(), target.c_str(), FALSE)) {
+    // A loaded DLL can't be overwritten but can be renamed: a running DAW keeps its copy until it restarts.
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    wchar_t suffix[32];
+    swprintf_s(suffix, L".old-%04u%02u%02u%02u%02u%02u", now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
+               now.wSecond);
+    if (!MoveFileExW(target.c_str(), (target + suffix).c_str(), MOVEFILE_REPLACE_EXISTING) ||
+        !CopyFileW(dll.c_str(), target.c_str(), FALSE)) {
+      return Failed("copying the driver to Program Files failed", GetLastError());
+    }
+  }
+  const long code = Regsvr32(target, false);
+  if (code != 0) return Failed("registering the driver failed", static_cast<DWORD>(code));
+  const AsioDriver installed = FindAsioDriver();
+  if (installed.state != AsioDriver::State::Installed ||
+      CompareStringOrdinal(installed.dll.c_str(), -1, target.c_str(), -1, TRUE) != CSTR_EQUAL) {
+    return "the registry doesn't match what was installed";
+  }
+  return {};
+}
+
+std::string UninstallAsioDriver() {
+  const std::wstring target = AsioInstallPath();
+  if (target.empty()) return "Program Files wasn't found";
+  if (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES) Regsvr32(target, true);
+  // Whatever regsvr32 left, or everything if the DLL was already gone.
+  RegDeleteTreeW(HKEY_LOCAL_MACHINE, (std::wstring(L"SOFTWARE\\Classes\\CLSID\\") + kClsidString).c_str());
+  RegDeleteTreeW(HKEY_LOCAL_MACHINE, (std::wstring(L"SOFTWARE\\ASIO\\") + kRegistryName).c_str());
+  if (FindAsioDriver().state != AsioDriver::State::NotInstalled) return "the driver's registry keys are still there";
+  // A DAW that still has it loaded keeps the file until Windows restarts.
+  const std::wstring folder = target.substr(0, target.find_last_of(L'\\'));
+  if (!DeleteFileW(target.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+    MoveFileExW(target.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+  }
+  DeleteOldCopies(folder, true);
+  if (!RemoveDirectoryW(folder.c_str())) MoveFileExW(folder.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+  return {};
+}
+
 void DriverLog::Refresh() {
   if (path_.empty()) {
     PWSTR base = nullptr;

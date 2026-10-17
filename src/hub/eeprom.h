@@ -21,6 +21,7 @@ struct FirmwareImage {
   uint8_t version = 0;         // 22 for v0.22 (bcdDevice 0x0022)
   uint16_t size = 0;           // payload bytes
   uint16_t checksum = 0;
+  bool avid = false;           // Avid's own firmware (a backup of the original chip), not the open firmware
 };
 
 // Reads and checks an image file. Returns an empty string if it's valid, else what's wrong with it.

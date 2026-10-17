@@ -45,8 +45,8 @@ small memory chip on the board at power-up. Replace that firmware and the driver
 - Live input and output meters with peak hold and clip lights.
 - Loudness (EBU R128 / LUFS, true peak, loudness range), spectrum and stereo phase analysis.
 - Health at a glance: clock lock, dropouts and USB packet gaps, with a dropout log and tray notifications.
-- One-click firmware updates over USB, and a check for new releases on GitHub.
-- ASIO driver install and buffer size setting.
+- Checks GitHub for new releases, updates itself in one click, and installs new firmware over USB.
+- Installs, updates and removes the ASIO driver, and sets its buffer size.
 - Starts with Windows in the tray if you want it to. Uses about 0.5 % CPU there.
 
 ## Install
@@ -158,12 +158,20 @@ them down), slide the board back into the case and screw the back panel on.
 
 ## Updates
 
-Mbox Hub checks GitHub for new releases. Firmware updates install over USB in about 30 seconds, with no Pi
-and no wires. **Unplug and replug the Mbox afterwards**: a restart of the Mbox's chip can leave its
-converter sounding distorted until it loses power once.
+Mbox Hub checks GitHub once a day for a new release. When there is one, a button appears at the top of its
+window:
 
-The update is written so that an interruption can't leave a half-written firmware that starts: the chip only
-becomes bootable again after the whole image is written and checked.
+- **A new hub:** click it and the hub downloads the new version, swaps it in and restarts itself. If the
+  release brings a newer ASIO driver, the DAW (ASIO) card then shows **Update**.
+- **New firmware:** it's ready on the Firmware card (cog > Firmware). Click **Install**: it goes in over USB
+  in about 30 seconds, with no Pi and no wires. **Unplug and replug the Mbox afterwards**: a restart of the
+  Mbox's chip can leave its converter sounding distorted until it loses power once.
+
+The firmware update is written so that an interruption can't leave a half-written firmware that starts: the
+chip only becomes bootable again after the whole image is written and checked.
+
+The tray icon's menu has **Check for updates now**, and **Check for updates daily** to turn the automatic check
+off. The check is one request to GitHub's API for the latest release; the hub sends nothing else.
 
 ## Using it with a DAW
 
@@ -177,6 +185,8 @@ Live:
 
 While a DAW uses the ASIO driver it has the Mbox to itself, so other programs can't play through it. Close
 Mbox Hub's window to the tray first: its input meters hold the inputs open.
+
+To remove the driver, click **Remove** on Mbox Hub's DAW (ASIO) card.
 
 ## Going back to Avid's firmware
 
@@ -214,13 +224,17 @@ cmake --build build --config Release
 `tools\firmware\build.ps1` builds `build\firmware\mbox2-open.bin`, and `-Install` also installs it over USB.
 On Linux, `firmware/build.sh` does the same build.
 
+**A release:** `tools\release\package.ps1` builds everything and puts the release files in `dist\`. The
+version comes from `project(... VERSION ...)` in `CMakeLists.txt`. A fork that publishes its own releases sets
+`-DMBOX2_REPOSITORY=owner/name`, so its hub updates from them.
+
 | Folder | What's in it |
 |---|---|
 | `firmware/` | The firmware: C for the TUSB3200A's 8052 core, written from TI's documentation |
 | `src/hub/` | Mbox Hub |
 | `src/asio/` | The ASIO driver (a user-mode COM DLL on WASAPI exclusive mode) and its test host |
 | `pi/` | The Raspberry Pi installer and its I2C tools |
-| `tools/` | Firmware build and USB install scripts, ASIO install scripts, Avid driver cleanup |
+| `tools/` | Firmware build and USB install scripts, ASIO install scripts, Avid driver cleanup, release packaging |
 | `third_party/asiosdk/` | The three ASIO interface headers from Steinberg's ASIO SDK |
 
 ## License

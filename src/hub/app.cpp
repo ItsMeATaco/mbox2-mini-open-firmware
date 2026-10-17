@@ -8,6 +8,12 @@
 //   mbox2hub.exe --snapshot x.png   run hidden for 3 s, save the window's image, exit
 //   ... --view levels|loudness|spectrum|phase   open on that tab (for snapshots)
 //   ... --panel open|closed         with the settings cog's side column open or closed (for snapshots)
+//   ... --delay SECONDS             wait that long before the snapshot (default 3), e.g. for the clock to lock
+//
+// Run by the hub itself:
+//   mbox2hub.exe --install-asio DLL --result FILE   elevated: install and register the ASIO driver
+//   mbox2hub.exe --uninstall-asio --result FILE     elevated: remove it
+//   mbox2hub.exe --after-update PID                 the updated hub, started by the old one before it quits
 
 #include <windows.h>
 #include <windowsx.h>
@@ -23,10 +29,12 @@
 #include <cstdarg>
 #include <cstdio>
 #include <ctime>
+#include <cwctype>
 #include <functional>
 #include <iterator>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "hub/analysis.h"
 #include "hub/asio_driver.h"
@@ -34,6 +42,7 @@
 #include "hub/eeprom.h"
 #include "hub/meters.h"
 #include "hub/ui.h"
+#include "hub/update.h"
 
 namespace {
 
@@ -44,16 +53,22 @@ constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Ru
 constexpr wchar_t kStartupApprovedKey[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
 constexpr wchar_t kRunValue[] = L"Mbox2Hub";
+constexpr wchar_t kHubVersion[] = L"" MBOX2_VERSION;  // the release this hub belongs to (CMake's project version)
 constexpr UINT kMsgChanged = WM_APP + 1;  // the device link has news
 constexpr UINT kMsgTray = WM_APP + 2;
 constexpr UINT kMsgShow = WM_APP + 3;     // a second launch asks the running one to show itself
 constexpr UINT kMsgDropout = WM_APP + 4;
+constexpr UINT kMsgUpdate = WM_APP + 5;   // the updater has news
 constexpr UINT_PTR kTimerFrame = 1;
 constexpr UINT_PTR kTimerHousekeeping = 2;
 constexpr UINT_PTR kTimerSnapshot = 3;
+constexpr UINT_PTR kTimerUpdate = 4;
 constexpr UINT kFrameMs = 33;
 constexpr UINT kHousekeepingMs = 1000;
 constexpr UINT kSnapshotDelayMs = 3000;
+constexpr UINT kFirstCheckMs = 20000;    // the first look for a new release, after starting
+constexpr UINT kCheckTimerMs = 3600000;  // then hourly, checking again once a day has passed
+constexpr ULONGLONG kCheckIntervalMs = 24ull * 3600000;
 // With the side column open; closed, the window is Ui::kSideWidth narrower and needs less height.
 constexpr float kDefaultWidth = 1080.0f, kDefaultHeight = 940.0f;
 constexpr float kCompactHeight = 840.0f;
@@ -67,7 +82,7 @@ constexpr float kPeakHoldSeconds = 1.5f;
 constexpr float kPeakFallDbPerSecond = 20.0f;
 constexpr float kClipLevel = 0.9886f;  // -0.1 dBFS
 
-enum MenuId : UINT { kMenuOpen = 1, kMenuStartup, kMenuLog, kMenuQuit };
+enum MenuId : UINT { kMenuOpen = 1, kMenuStartup, kMenuLog, kMenuCheckUpdates, kMenuAutoUpdates, kMenuQuit };
 
 std::wstring LocalAppDataDir() {
   PWSTR base = nullptr;
@@ -191,13 +206,90 @@ bool SamePath(const std::wstring& a, const std::wstring& b) {
   return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
 }
 
-// build\src\hub\Release\mbox2hub.exe -> build\firmware\mbox2-open.bin, where firmware\build.sh's image lands.
-std::wstring DefaultImagePath() {
-  std::wstring guess = ExePath();
-  guess = guess.substr(0, guess.find_last_of(L'\\')) + L"\\..\\..\\..\\firmware\\mbox2-open.bin";
+std::wstring Folder(const std::wstring& path) { return path.substr(0, path.find_last_of(L'\\')); }
+std::wstring HubFolder() { return Folder(ExePath()); }
+bool Exists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+std::wstring FullPath(const std::wstring& path) {
   wchar_t full[MAX_PATH] = {};
-  if (!GetFullPathNameW(guess.c_str(), MAX_PATH, full, nullptr)) return {};
-  return GetFileAttributesW(full) != INVALID_FILE_ATTRIBUTES ? full : L"";
+  return GetFullPathNameW(path.c_str(), MAX_PATH, full, nullptr) ? full : L"";
+}
+
+// Running from a build tree (build\src\hub\Release): the hub takes the firmware and the ASIO driver from the
+// build, and doesn't replace itself with a release.
+bool InBuildTree() {
+  const std::wstring folder = HubFolder();
+  for (const wchar_t* tail : {L"\\src\\hub\\Release", L"\\src\\hub\\Debug"}) {
+    const size_t n = wcslen(tail);
+    if (folder.size() > n && _wcsicmp(folder.c_str() + folder.size() - n, tail) == 0) return true;
+  }
+  return false;
+}
+
+std::wstring UpdatesFolder() { return LocalAppDataDir() + L"\\updates"; }
+std::wstring DownloadedFirmwarePath() { return UpdatesFolder() + L"\\" + kFirmwareFile; }
+
+// The firmware the hub offers: the newest open-firmware image among firmware\build.sh's output (in a build
+// tree), the one next to the hub (the release zip) and the one the latest GitHub release brought.
+std::wstring DefaultImagePath() {
+  std::wstring best;
+  int best_version = -1;
+  const std::wstring candidates[] = {
+      InBuildTree() ? FullPath(HubFolder() + L"\\..\\..\\..\\firmware\\mbox2-open.bin") : L"",
+      HubFolder() + L"\\" + kFirmwareFile,
+      DownloadedFirmwarePath(),
+  };
+  for (const std::wstring& candidate : candidates) {
+    FirmwareImage image;
+    if (!candidate.empty() && Exists(candidate) && LoadFirmwareImage(candidate, &image).empty() && !image.avid &&
+        image.version > best_version) {
+      best = candidate;
+      best_version = image.version;
+    }
+  }
+  return best;
+}
+
+// The ASIO driver the hub installs: the one next to it (the release zip), or in a build tree the build's.
+std::wstring BundledDriverPath() {
+  const std::wstring next = HubFolder() + L"\\" + kDriverFile;
+  if (Exists(next)) return next;
+  if (!InBuildTree()) return {};
+  const std::wstring built = FullPath(HubFolder() + L"\\..\\..\\asio\\" + FileName(HubFolder()) + L"\\" + kDriverFile);
+  return Exists(built) ? built : L"";
+}
+
+bool SameContents(const std::wstring& a, const std::wstring& b) {
+  auto read = [](const std::wstring& path, std::string* data) {
+    FILE* file = _wfopen(path.c_str(), L"rb");
+    if (!file) return false;
+    char buffer[65536];
+    for (size_t n; (n = fread(buffer, 1, sizeof buffer, file)) > 0;) data->append(buffer, n);
+    fclose(file);
+    return true;
+  };
+  std::string x, y;
+  return read(a, &x) && read(b, &y) && x == y;
+}
+
+bool FolderWritable(const std::wstring& folder) {
+  HANDLE probe = CreateFileW((folder + L"\\.mbox2hub-write-test").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+  if (probe == INVALID_HANDLE_VALUE) return false;
+  CloseHandle(probe);
+  return true;
+}
+
+// bcdDevice 0x0025 -> 25, the image header's version byte for the same firmware.
+int FirmwareNumber(unsigned bcd) { return (bcd >> 8) * 100 + (bcd >> 4 & 15) * 10 + (bcd & 15); }
+
+// The start of a release's notes, cut at a line end, for a message box.
+std::wstring Excerpt(const std::wstring& notes, size_t limit) {
+  std::wstring text = notes;
+  text.erase(std::remove(text.begin(), text.end(), L'\r'), text.end());
+  if (text.size() <= limit) return text;
+  const size_t cut = text.rfind(L'\n', limit);
+  return text.substr(0, cut == std::wstring::npos || cut < limit / 2 ? limit : cut) + L"\n\x2026";
 }
 
 // "Start with Windows": HKCU Run entry (per user, no administrator rights). Task Manager's Startup apps
@@ -274,9 +366,16 @@ HICON MakeIcon(int size, COLORREF color) {
 
 class App {
  public:
-  App() : log_(L"hub.log"), dropout_log_(L"dropouts.log") {}
+  App()
+      : log_(L"hub.log"),
+        dropout_log_(L"dropouts.log"),
+        updater_(std::wstring(L"Mbox2Hub/") + kHubVersion, [this] {
+          if (HWND hwnd = hwnd_) PostMessageW(hwnd, kMsgUpdate, 0, 0);
+        }) {}
   // view: the tab to open on (for --snapshot), or -1 for the last one used; panel likewise 0 closed, 1 open.
-  int Run(HINSTANCE instance, bool start_in_tray, std::wstring snapshot_path, int view, int panel);
+  // after_update: this hub was just installed by the one before it.
+  int Run(HINSTANCE instance, bool start_in_tray, std::wstring snapshot_path, UINT snapshot_delay_ms, int view,
+          int panel, bool after_update);
 
  private:
   static LRESULT CALLBACK Proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
@@ -294,6 +393,14 @@ class App {
   void Install();
   void RefreshDriver();
   void SetDriverBuffer(int frames);
+  void RunElevated(const std::wstring& arguments, const wchar_t* doing);
+  void FinishElevated();
+  void CheckForUpdates(bool manual);
+  void OnUpdate();
+  void OfferUpdate();
+  void ApplyHubUpdate(const std::wstring& folder);
+  bool HubUpdateAvailable() const { return !release_.tag.empty() && CompareVersions(release_.tag, kHubVersion) > 0; }
+  bool FirmwareUpdateAvailable() const;
   void ToggleStartup();
   void ToggleSidePanel();
   void OpenLog();
@@ -341,6 +448,20 @@ class App {
   AsioDriver driver_;
   int driver_buffer_ = 0;
   DriverLog driver_log_;
+  std::wstring bundled_driver_;    // the copy next to the hub, which Install / Update puts in Program Files
+  bool driver_current_ = true;     // the installed driver is that copy
+  std::wstring driver_compared_;   // the files' sizes and times when driver_current_ was worked out
+  HANDLE elevated_ = nullptr;      // the elevated copy of the hub installing or removing the driver
+  std::wstring elevated_doing_;    // "Installing", "Removing"
+  std::wstring elevated_result_;   // the file it writes what went wrong to
+
+  // New releases on GitHub
+  Updater updater_;
+  Updater::State update_state_ = Updater::State::Idle;
+  Release release_;                // the latest release, once a check succeeded
+  int release_firmware_ = -1;      // its firmware image's version, -1 if it brought none
+  ULONGLONG last_check_ = 0;       // GetTickCount64() of the last successful check
+  UINT snapshot_delay_ms_ = kSnapshotDelayMs;
 
   Startup startup_ = Startup::Off;
   std::wstring image_path_;
@@ -359,13 +480,15 @@ class App {
   uint32_t phase_rate_ = 0;  // the rate phase_ was reset for; 0 before its first audio
 };
 
-int App::Run(HINSTANCE instance, bool start_in_tray, std::wstring snapshot_path, int view, int panel) {
+int App::Run(HINSTANCE instance, bool start_in_tray, std::wstring snapshot_path, UINT snapshot_delay_ms, int view,
+             int panel, bool after_update) {
   instance_ = instance;
   snapshot_path_ = std::move(snapshot_path);
+  snapshot_delay_ms_ = snapshot_delay_ms;
   QueryPerformanceFrequency(&frequency_);
   QueryPerformanceCounter(&last_frame_);
   GetLocalTime(&started_);
-  log_.Write("---- Mbox Hub started");
+  log_.Write("---- Mbox Hub " + Narrow(kHubVersion) + " started" + (after_update ? " (just updated)" : ""));
   RegDeleteKeyValueW(HKEY_CURRENT_USER, kSettingsKey, L"BufferIndex");  // the placeholder's, before the driver
   RefreshDriver();
   view_ = static_cast<View>(view >= 0 ? std::min(view, 3) : std::min<DWORD>(ReadSetting(L"View", 0), 3));
@@ -397,6 +520,7 @@ int App::Run(HINSTANCE instance, bool start_in_tray, std::wstring snapshot_path,
   hwnd_ = CreateWindowExW(0, kClassName, kTitle, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                           frame.right - frame.left, frame.bottom - frame.top, nullptr, nullptr, instance, this);
   if (!hwnd_) return 1;
+  SetWindowTextW(hwnd_, (std::wstring(kTitle) + L" v" + kHubVersion).c_str());
 
   BOOL dark = TRUE;
   DwmSetWindowAttribute(hwnd_, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof dark);
@@ -432,10 +556,14 @@ int App::Run(HINSTANCE instance, bool start_in_tray, std::wstring snapshot_path,
     meters_.SetInputsWanted(true);
     meters_.SetOutputWanted(true);
     SetTimer(hwnd_, kTimerFrame, kFrameMs, nullptr);  // keep the meters moving while hidden
-    SetTimer(hwnd_, kTimerSnapshot, kSnapshotDelayMs, nullptr);
+    SetTimer(hwnd_, kTimerSnapshot, snapshot_delay_ms_, nullptr);
   } else {
     taskbar_created_ = RegisterWindowMessageW(L"TaskbarCreated");
     AddTrayIcon();
+    SetTimer(hwnd_, kTimerUpdate, kFirstCheckMs, nullptr);
+    if (after_update) {
+      Notify(L"Mbox Hub updated", std::wstring(L"Now running Mbox Hub v") + kHubVersion + L".");
+    }
   }
   if (start_in_tray || !snapshot_path_.empty()) {
     told_about_tray_ = true;
@@ -511,6 +639,12 @@ LRESULT App::Handle(UINT message, WPARAM wparam, LPARAM lparam) {
     case WM_TIMER:
       if (wparam == kTimerFrame) OnFrame();
       if (wparam == kTimerHousekeeping) OnHousekeeping();
+      if (wparam == kTimerUpdate) {
+        SetTimer(hwnd_, kTimerUpdate, kCheckTimerMs, nullptr);
+        if (ReadSetting(L"CheckForUpdates", 1) && (!last_check_ || GetTickCount64() - last_check_ >= kCheckIntervalMs)) {
+          CheckForUpdates(false);
+        }
+      }
       if (wparam == kTimerSnapshot) {
         KillTimer(hwnd_, kTimerSnapshot);
         UpdateModel();
@@ -529,6 +663,9 @@ LRESULT App::Handle(UINT message, WPARAM wparam, LPARAM lparam) {
       return 0;
     case kMsgDropout:
       OnDropout();
+      return 0;
+    case kMsgUpdate:
+      OnUpdate();
       return 0;
     case kMsgShow:
       ShowMainWindow();
@@ -590,6 +727,12 @@ LRESULT App::Handle(UINT message, WPARAM wparam, LPARAM lparam) {
         case kMenuLog:
           OpenLog();
           break;
+        case kMenuCheckUpdates:
+          CheckForUpdates(true);
+          break;
+        case kMenuAutoUpdates:
+          WriteSetting(L"CheckForUpdates", ReadSetting(L"CheckForUpdates", 1) ? 0 : 1);
+          break;
         case kMenuQuit:
           if (status_.install.state == DeviceLink::Install::State::Running) {
             MessageBoxW(hwnd_, L"A firmware install is running. Quit once it has finished (under a minute).", kTitle,
@@ -603,6 +746,7 @@ LRESULT App::Handle(UINT message, WPARAM wparam, LPARAM lparam) {
     case WM_DESTROY:
       KillTimer(hwnd_, kTimerFrame);
       KillTimer(hwnd_, kTimerHousekeeping);
+      KillTimer(hwnd_, kTimerUpdate);
       link_.Stop();
       meters_.SetInputsWanted(false);
       Shell_NotifyIconW(NIM_DELETE, &tray_);
@@ -642,6 +786,7 @@ void App::OnHousekeeping() {
   startup_ = ReadStartup();  // Task Manager or another copy may change it
   CheckImageFile();
   meters_.Refresh();
+  if (elevated_ && WaitForSingleObject(elevated_, 0) == WAIT_OBJECT_0) FinishElevated();
   if (Visible() || !snapshot_path_.empty()) RefreshDriver();
   OnChanged();
 }
@@ -728,7 +873,7 @@ void App::UpdateModel() {
     case Presence::AvidFirmware:
       model_.status = L"Avid firmware";
       model_.status_kind = 2;
-      model_.subtitle = L"The Mbox runs Avid's firmware; the hub needs the open firmware (README: Firmware tools).";
+      model_.subtitle = L"The Mbox runs Avid's firmware. Put the open firmware on with a Raspberry Pi (see the README).";
       break;
     case Presence::BootRom:
       model_.status = L"No firmware";
@@ -740,6 +885,16 @@ void App::UpdateModel() {
       model_.status_kind = 0;
       model_.subtitle = L"Plug in the Mbox to start.";
       break;
+  }
+
+  // A newer release on GitHub: of the hub (with its driver and firmware), or just firmware newer than the Mbox's.
+  model_.update.clear();
+  if (update_state_ == Updater::State::Downloading) {
+    model_.update = L"Downloading " + release_.tag + L"\x2026";
+  } else if (HubUpdateAvailable()) {
+    model_.update = L"Update to " + release_.tag;
+  } else if (FirmwareUpdateAvailable()) {
+    model_.update = L"Firmware " + Version(release_firmware_);
   }
 
   // ---- Meters
@@ -828,13 +983,14 @@ void App::UpdateModel() {
   model_.fw_image = FileName(image_path_);
   model_.fw_image_ok = image_problem_.empty() && !image_path_.empty();
   if (image_path_.empty()) {
-    model_.fw_image_info = L"Choose a .bin image built by firmware/build.sh";
+    model_.fw_image_info = L"Choose a firmware image (.bin)";
   } else if (!image_problem_.empty()) {
     model_.fw_image_info = L"Not usable: " + Widen(image_problem_);
   } else {
-    model_.fw_image_info = Version(image_.version) + L" \x00B7 " + Grouped(image_.size) + L" bytes of code \x00B7 sum " +
-                           Printf(L"%04X OK", image_.checksum);
+    model_.fw_image_info = (image_.avid ? L"Avid's firmware " : L"") + Version(image_.version) + L" \x00B7 " +
+                           Grouped(image_.size) + L" bytes of code \x00B7 sum " + Printf(L"%04X OK", image_.checksum);
   }
+  const int installed = open ? FirmwareNumber(s.firmware) : -1;
   model_.fw_busy = s.install.state == State::Running;
   model_.fw_can_install = ready && model_.fw_image_ok && !model_.fw_busy;
   model_.fw_progress = s.install.total ? static_cast<float>(s.install.done) / s.install.total : 0.0f;
@@ -861,8 +1017,15 @@ void App::UpdateModel() {
   } else if (s.maintenance == Maintenance::Missing) {
     model_.fw_note = L"This firmware has no maintenance interface (v0.19+): use the Raspberry Pi.";
     model_.fw_note_kind = 2;
-  } else if (model_.fw_image_ok && image_.version == ((s.firmware >> 8) * 100 + (s.firmware >> 4 & 15) * 10 + (s.firmware & 15))) {
+  } else if (model_.fw_image_ok && image_.avid) {
+    model_.fw_note = L"Avid's original firmware: afterwards the Mbox needs Avid's driver again, and this hub can't "
+                     L"reach it.";
+    model_.fw_note_kind = 2;
+  } else if (model_.fw_image_ok && image_.version == installed) {
     model_.fw_note = L"Same version as installed. Takes about 30 s; replug the Mbox afterwards.";
+  } else if (model_.fw_image_ok && image_.version > installed) {
+    model_.fw_note = L"Newer than the Mbox's " + Bcd(s.firmware) + L". Takes about 30 s; replug the Mbox afterwards.";
+    model_.fw_note_kind = 2;
   } else {
     model_.fw_note = L"Takes about 30 s; sound stops when the Mbox reboots. Replug it afterwards.";
   }
@@ -882,26 +1045,50 @@ void App::UpdateModel() {
 
   // ---- DAW (ASIO)
   using Driver = AsioDriver::State;
-  model_.daw_path_attention = driver_.state != Driver::Installed;
-  model_.daw_badge = L"Needs reinstall";
+  const bool can_install = !bundled_driver_.empty();
+  const wchar_t* missing = L"mbox2asio.dll isn't next to mbox2hub.exe: unzip the release again.";
+  model_.daw_path_attention = driver_.state != Driver::Installed || !driver_current_;
+  model_.daw_badge = L"Needs repair";
+  model_.daw_action.clear();
+  model_.daw_action_enabled = true;
+  model_.daw_remove = false;
   switch (driver_.state) {
     case Driver::Installed:
       model_.daw_badge = L"Installed";
       model_.daw_path = driver_.dll;
+      if (!driver_current_ && can_install) {
+        model_.daw_action = L"Update";
+        model_.daw_path = L"This hub brought a newer driver";
+      } else {
+        model_.daw_remove = true;
+      }
       break;
     case Driver::NotInstalled:
       model_.daw_badge = L"Not installed";
-      model_.daw_path = L"Install: run tools\\asio\\install.ps1 (asks for admin)";
+      model_.daw_action = can_install ? L"Install" : L"";
+      model_.daw_path = can_install ? L"Install asks for administrator rights" : missing;
       break;
     case Driver::OtherClass:
-      model_.daw_path = L"Wrong CLSID: run tools\\asio\\install.ps1 again";
+      model_.daw_path = L"Its registry entry names another driver";
       break;
     case Driver::NoServer:
-      model_.daw_path = L"COM class missing: run tools\\asio\\install.ps1 again";
+      model_.daw_path = L"Its COM registration is missing";
       break;
     case Driver::DllMissing:
-      model_.daw_path = L"DLL missing: run tools\\asio\\install.ps1 again";
+      model_.daw_path = L"Its DLL is missing";
       break;
+  }
+  if (driver_.state != Driver::Installed && driver_.state != Driver::NotInstalled) {
+    if (can_install) {
+      model_.daw_action = L"Repair";
+    } else {
+      model_.daw_path = missing;
+    }
+  }
+  if (elevated_) {
+    model_.daw_action = elevated_doing_ + L"\x2026";
+    model_.daw_action_enabled = false;
+    model_.daw_remove = false;
   }
 
   model_.daw_buffer = -1;
@@ -975,10 +1162,12 @@ void App::UpdateModel() {
     default: model_.startup_note = L"In the tray, for this Windows user"; break;
   }
 
-  // An install's progress or outcome, or a broken driver registration, puts a dot on the closed cog.
+  // An install's progress or outcome, a broken or outdated driver, or newer firmware puts a dot on the closed cog.
   model_.side_open = side_open_;
   model_.side_attention = model_.fw_busy || s.install.state == State::Done || s.install.state == State::Failed ||
-                          (driver_.state != Driver::Installed && driver_.state != Driver::NotInstalled);
+                          (driver_.state != Driver::Installed && driver_.state != Driver::NotInstalled) ||
+                          (driver_.state == Driver::Installed && !driver_current_ && can_install) ||
+                          (model_.fw_image_ok && !image_.avid && installed >= 0 && image_.version > installed);
 
   model_.view = view_;
   model_.source = source_;
@@ -1014,6 +1203,20 @@ void App::Click(Hit hit) {
       break;
     case Hit::Settings:
       ToggleSidePanel();
+      break;
+    case Hit::Update:
+      OfferUpdate();
+      break;
+    case Hit::DawAction:
+      if (!bundled_driver_.empty()) RunElevated(L"--install-asio \"" + bundled_driver_ + L"\"", L"Installing");
+      break;
+    case Hit::DawRemove:
+      if (MessageBoxW(hwnd_,
+                      L"Remove the ASIO driver?\n\nDAWs stop listing \"Mbox 2 Mini (open firmware)\". A DAW that has it "
+                      L"open keeps its copy until it restarts.",
+                      kTitle, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
+        RunElevated(L"--uninstall-asio", L"Removing");
+      }
       break;
     case Hit::Buffer0:
     case Hit::Buffer1:
@@ -1104,6 +1307,13 @@ void App::Install() {
                       L", " + Grouped(image_.size) + L" bytes of code, replacing " + Bcd(status_.firmware) +
                       L".\n\nIt takes about 30 seconds. Keep the Mbox plugged in until the hub says it's done. Sound "
                       L"may crackle while it writes and stops when the Mbox reboots; then unplug and replug it.";
+  if (image_.avid) {
+    text = L"Put Avid's firmware " + Version(image_.version) + L" back on the Mbox?\n\n" + FileName(image_path_) +
+           L" replaces the open firmware " + Bcd(status_.firmware) +
+           L". Afterwards the Mbox needs Avid's driver again (which needs Memory Integrity off), and this hub can't "
+           L"reach it any more: the open firmware can only go back on with the Raspberry Pi.\n\nIt takes about 30 "
+           L"seconds. Keep the Mbox plugged in until the hub says it's done, then unplug and replug it.";
+  }
   if (MessageBoxW(hwnd_, text.c_str(), kTitle, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
   if (link_.StartInstall(image_)) {
     install_state_ = DeviceLink::Install::State::Running;
@@ -1116,6 +1326,243 @@ void App::RefreshDriver() {
   driver_ = FindAsioDriver();
   driver_buffer_ = ReadDriverBuffer();
   driver_log_.Refresh();
+  // Whether the installed driver is the copy next to the hub: compared again only when either file changes.
+  bundled_driver_ = BundledDriverPath();
+  if (driver_.state != AsioDriver::State::Installed || bundled_driver_.empty()) {
+    driver_current_ = true;
+    driver_compared_.clear();
+    return;
+  }
+  std::wstring key;
+  for (const std::wstring& path : {driver_.dll, bundled_driver_}) {
+    WIN32_FILE_ATTRIBUTE_DATA info{};
+    GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &info);
+    key += path + Printf(L"|%lu|%lu|%lu|", info.nFileSizeLow, info.ftLastWriteTime.dwLowDateTime,
+                         info.ftLastWriteTime.dwHighDateTime);
+  }
+  if (key != driver_compared_) {
+    driver_compared_ = key;
+    driver_current_ = SameContents(driver_.dll, bundled_driver_);
+  }
+}
+
+// Installing or removing the driver writes to Program Files and HKLM, so a copy of the hub does it with
+// administrator rights (wWinMain: --install-asio / --uninstall-asio); Windows asks the user first.
+void App::RunElevated(const std::wstring& arguments, const wchar_t* doing) {
+  if (elevated_) return;
+  elevated_result_ = LocalAppDataDir() + L"\\elevated-result.txt";
+  DeleteFileW(elevated_result_.c_str());
+  const std::wstring exe = ExePath();
+  const std::wstring parameters = arguments + L" --result \"" + elevated_result_ + L"\"";
+  SHELLEXECUTEINFOW info{sizeof info};
+  info.fMask = SEE_MASK_NOCLOSEPROCESS;
+  info.hwnd = hwnd_;
+  info.lpVerb = L"runas";
+  info.lpFile = exe.c_str();
+  info.lpParameters = parameters.c_str();
+  info.nShow = SW_HIDE;
+  if (!ShellExecuteExW(&info) || !info.hProcess) {
+    if (GetLastError() != ERROR_CANCELLED) {
+      MessageBoxW(hwnd_, Printf(L"Couldn't start the driver setup (error %lu).", GetLastError()).c_str(), kTitle,
+                  MB_OK | MB_ICONERROR);
+    }
+    return;
+  }
+  elevated_ = info.hProcess;
+  elevated_doing_ = doing;
+  log_.Write("ASIO driver: " + Narrow(doing) + " (elevated)");
+  UpdateModel();
+  Repaint();
+}
+
+void App::FinishElevated() {
+  DWORD code = 1;
+  GetExitCodeProcess(elevated_, &code);
+  CloseHandle(elevated_);
+  elevated_ = nullptr;
+  std::string error;
+  if (FILE* file = _wfopen(elevated_result_.c_str(), L"rb")) {
+    char buffer[512];
+    error.assign(buffer, fread(buffer, 1, sizeof buffer, file));
+    fclose(file);
+  }
+  DeleteFileW(elevated_result_.c_str());
+  const bool installing = elevated_doing_ == L"Installing";
+  driver_compared_.clear();
+  RefreshDriver();
+  if (code != 0) {
+    if (error.empty()) error = "exit code " + std::to_string(code);
+    log_.Write("ASIO driver: failed: " + error);
+    MessageBoxW(hwnd_,
+                ((installing ? L"Installing the ASIO driver failed: " : L"Removing the ASIO driver failed: ") +
+                 Widen(error) + L".")
+                    .c_str(),
+                kTitle, MB_OK | MB_ICONERROR);
+  } else {
+    log_.Write(installing ? "ASIO driver: installed" : "ASIO driver: removed");
+    if (installing && Visible()) {
+      MessageBoxW(hwnd_,
+                  L"The ASIO driver is installed.\n\nIn your DAW's audio settings, choose the ASIO driver type and "
+                  L"\"Mbox 2 Mini (open firmware)\". A DAW that was already open needs a restart to see it.",
+                  kTitle, MB_OK | MB_ICONINFORMATION);
+    }
+  }
+  UpdateModel();
+  Repaint();
+}
+
+bool App::FirmwareUpdateAvailable() const {
+  return release_firmware_ >= 0 && status_.presence == DeviceLink::Presence::OpenFirmware &&
+         release_firmware_ > FirmwareNumber(status_.firmware);
+}
+
+void App::CheckForUpdates(bool manual) {
+  if (updater_.Busy()) return;
+  updater_.Check(DownloadedFirmwarePath(), manual);
+}
+
+void App::OnUpdate() {
+  const Updater::Status u = updater_.GetStatus();
+  const Updater::State previous = update_state_;
+  update_state_ = u.state;
+  using State = Updater::State;
+  if (previous == State::Checking && u.state == State::Checked) {
+    last_check_ = GetTickCount64();
+    release_ = u.release;
+    release_firmware_ = -1;
+    FirmwareImage fresh;
+    if (!u.firmware.empty() && LoadFirmwareImage(u.firmware, &fresh).empty()) {
+      release_firmware_ = fresh.version;
+      // Newer firmware from GitHub becomes the offered image, unless Avid's firmware was chosen to restore.
+      const bool newer = image_path_.empty() || !image_problem_.empty() || fresh.version > image_.version;
+      if ((newer && !image_.avid) || SamePath(image_path_, u.firmware)) {
+        SetImage(u.firmware);
+        RegDeleteKeyValueW(HKEY_CURRENT_USER, kSettingsKey, L"FirmwareImage");
+      }
+    }
+    log_.Write("Update check: latest release " + Narrow(release_.tag) +
+               (release_firmware_ >= 0 ? ", firmware " + Narrow(Version(release_firmware_)) : ""));
+    const bool hub = HubUpdateAvailable(), firmware = FirmwareUpdateAvailable();
+    if ((hub || firmware) && !u.manual && ReadString(kSettingsKey, L"NotifiedRelease") != release_.tag) {
+      WriteString(kSettingsKey, L"NotifiedRelease", release_.tag);
+      Notify(L"Mbox update available",
+             hub ? L"Mbox Hub " + release_.tag + L" is out. Open the hub and click the update button at the top."
+                 : L"Firmware " + Version(release_firmware_) + L" is out. Open the hub and click the update button at "
+                   L"the top.");
+    }
+    if (u.manual) {
+      if (hub || firmware) {
+        if (!Visible()) ShowMainWindow();
+        OfferUpdate();
+      } else {
+        MessageBoxW(hwnd_, (std::wstring(L"Mbox Hub v") + kHubVersion + L" is up to date (latest release: " +
+                            release_.tag + L").")
+                               .c_str(),
+                    kTitle, MB_OK | MB_ICONINFORMATION);
+      }
+    }
+  } else if (previous == State::Checking && u.state == State::Failed) {
+    log_.Write("Update check failed: " + u.error);
+    if (u.manual) {
+      MessageBoxW(hwnd_, (L"Couldn't check GitHub for updates: " + Widen(u.error) + L".").c_str(), kTitle,
+                  MB_OK | MB_ICONWARNING);
+    }
+  } else if (previous == State::Downloading && u.state == State::Downloaded) {
+    ApplyHubUpdate(u.folder);
+  } else if (previous == State::Downloading && u.state == State::Failed) {
+    log_.Write("Update download failed: " + u.error);
+    MessageBoxW(hwnd_, (L"Downloading the update failed: " + Widen(u.error) + L".").c_str(), kTitle,
+                MB_OK | MB_ICONWARNING);
+  }
+  UpdateModel();
+  Repaint();
+}
+
+// The header's update pill: a new hub replaces this one (it brings its driver and firmware along, offered on
+// their cards afterwards); newer firmware alone goes straight to the Firmware card's install.
+void App::OfferUpdate() {
+  if (!HubUpdateAvailable()) {
+    if (FirmwareUpdateAvailable()) {
+      if (!side_open_) ToggleSidePanel();
+      Install();
+    }
+    return;
+  }
+  if (updater_.Busy()) return;
+  std::wstring text = L"Mbox Hub " + release_.tag + L" is available (this is v" + kHubVersion + L").";
+  if (!release_.title.empty() && release_.title != release_.tag) text += L"\n\n" + release_.title;
+  const std::wstring notes = Excerpt(release_.notes, 700);
+  if (!notes.empty()) text += L"\n\n" + notes;
+  const wchar_t* blocked = InBuildTree()                 ? L"it runs from a build folder"
+                           : !FolderWritable(HubFolder()) ? L"Windows doesn't let it change its own folder"
+                                                          : nullptr;
+  if (blocked) {
+    text += std::wstring(L"\n\nThis copy can't update itself: ") + blocked + L". Open the release page?";
+    if (MessageBoxW(hwnd_, text.c_str(), kTitle, MB_YESNO | MB_ICONINFORMATION) == IDYES) {
+      ShellExecuteW(hwnd_, L"open", release_.page.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+    return;
+  }
+  text += L"\n\nDownload and install it now? The hub restarts by itself. A newer ASIO driver or firmware that "
+          L"comes with it is offered on its card afterwards.";
+  if (MessageBoxW(hwnd_, text.c_str(), kTitle, MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+  if (status_.install.state == DeviceLink::Install::State::Running) {
+    MessageBoxW(hwnd_, L"A firmware install is running: update the hub once it has finished.", kTitle,
+                MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  std::wstring tag = release_.tag;
+  for (wchar_t& c : tag) {
+    if (!iswalnum(c) && c != L'.' && c != L'-') c = L'_';
+  }
+  updater_.Download(UpdatesFolder() + L"\\" + tag);
+  log_.Write("Hub update: downloading " + Narrow(release_.tag));
+}
+
+// Swaps the downloaded files in next to the running hub (a running exe can be renamed, not overwritten), starts
+// the new hub and quits; the new one waits for this one to exit and deletes the old files.
+void App::ApplyHubUpdate(const std::wstring& folder) {
+  const std::wstring hub = HubFolder();
+  std::vector<std::wstring> set_aside;
+  std::wstring failure;
+  for (const wchar_t* name : {kHubFile, kDriverFile, kFirmwareFile}) {
+    const std::wstring source = folder + L"\\" + name;
+    const std::wstring target = name == kHubFile ? ExePath() : hub + L"\\" + name;
+    if (!Exists(source)) continue;
+    if (Exists(target)) {
+      if (!MoveFileExW(target.c_str(), (target + L".old").c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        failure = Printf(L"setting %s aside failed (error %lu)", FileName(target).c_str(), GetLastError());
+        break;
+      }
+      set_aside.push_back(target);
+    }
+    if (!CopyFileW(source.c_str(), target.c_str(), FALSE)) {
+      failure = Printf(L"copying %s failed (error %lu)", name, GetLastError());
+      break;
+    }
+  }
+  std::wstring command = L"\"" + ExePath() + L"\" --after-update " + std::to_wstring(GetCurrentProcessId()) +
+                         (Visible() ? L"" : L" --tray");
+  STARTUPINFOW startup{sizeof startup};
+  PROCESS_INFORMATION process{};
+  if (failure.empty() && !CreateProcessW(ExePath().c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                                         nullptr, &startup, &process)) {
+    failure = Printf(L"starting the new hub failed (error %lu)", GetLastError());
+  }
+  if (!failure.empty()) {
+    for (const std::wstring& target : set_aside) {
+      DeleteFileW(target.c_str());
+      MoveFileExW((target + L".old").c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING);
+    }
+    log_.Write("Hub update failed: " + Narrow(failure));
+    MessageBoxW(hwnd_, (L"Updating the hub failed: " + failure + L". Nothing was changed.").c_str(), kTitle,
+                MB_OK | MB_ICONERROR);
+    return;
+  }
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  log_.Write("Hub update: installed " + Narrow(release_.tag) + ", restarting");
+  DestroyWindow(hwnd_);
 }
 
 // The driver reads it in getBufferSize(), so the DAW sees it the next time it opens the driver or asks.
@@ -1328,6 +1775,11 @@ void App::TrayMenu() {
   AppendMenuW(menu, MF_STRING | (startup ? MF_CHECKED : 0), kMenuStartup, L"Start with Windows");
   AppendMenuW(menu, MF_STRING, kMenuLog, L"Open dropout log");
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, (std::wstring(L"Mbox Hub v") + kHubVersion).c_str());
+  AppendMenuW(menu, MF_STRING | (updater_.Busy() ? MF_GRAYED : 0), kMenuCheckUpdates, L"Check for updates now");
+  AppendMenuW(menu, MF_STRING | (ReadSetting(L"CheckForUpdates", 1) ? MF_CHECKED : 0), kMenuAutoUpdates,
+              L"Check for updates daily");
+  AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(menu, MF_STRING, kMenuQuit, L"Quit");
   SetMenuDefaultItem(menu, kMenuOpen, FALSE);
   POINT cursor;
@@ -1344,12 +1796,24 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
   bool start_in_tray = false;
   std::wstring snapshot_path;
+  UINT snapshot_delay_ms = kSnapshotDelayMs;
   int view = -1, panel = -1;
+  DWORD after_update = 0;  // the old hub's process ID
+  bool install_asio = false, uninstall_asio = false;
+  std::wstring asio_dll, result_path;
   int argc = 0;
   wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   for (int i = 1; argv && i < argc; ++i) {
     if (wcscmp(argv[i], L"--tray") == 0) start_in_tray = true;
     if (wcscmp(argv[i], L"--snapshot") == 0 && i + 1 < argc) snapshot_path = argv[++i];
+    if (wcscmp(argv[i], L"--delay") == 0 && i + 1 < argc) snapshot_delay_ms = static_cast<UINT>(_wtof(argv[++i]) * 1000);
+    if (wcscmp(argv[i], L"--after-update") == 0 && i + 1 < argc) after_update = wcstoul(argv[++i], nullptr, 10);
+    if (wcscmp(argv[i], L"--install-asio") == 0 && i + 1 < argc) {
+      install_asio = true;
+      asio_dll = argv[++i];
+    }
+    if (wcscmp(argv[i], L"--uninstall-asio") == 0) uninstall_asio = true;
+    if (wcscmp(argv[i], L"--result") == 0 && i + 1 < argc) result_path = argv[++i];
     if (wcscmp(argv[i], L"--view") == 0 && i + 1 < argc) {
       static const wchar_t* const kViews[] = {L"levels", L"loudness", L"spectrum", L"phase"};
       ++i;
@@ -1365,6 +1829,33 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   }
   LocalFree(argv);
 
+  // The elevated copy that installs or removes the ASIO driver: no window, just the job and its outcome.
+  if (install_asio || uninstall_asio) {
+    const std::string error = install_asio ? InstallAsioDriver(asio_dll) : UninstallAsioDriver();
+    Logger(L"hub.log").Write(std::string(install_asio ? "Elevated ASIO driver install: " : "Elevated ASIO driver "
+                                                                                           "removal: ") +
+                             (error.empty() ? "done" : error));
+    if (!result_path.empty()) {
+      if (FILE* file = _wfopen(result_path.c_str(), L"wb")) {
+        fwrite(error.data(), 1, error.size(), file);
+        fclose(file);
+      }
+    }
+    return error.empty() ? 0 : 1;
+  }
+
+  // Started by the hub this one replaces: let it quit first, then delete the files it set aside.
+  if (after_update) {
+    if (HANDLE old = OpenProcess(SYNCHRONIZE, FALSE, after_update)) {
+      WaitForSingleObject(old, 15000);
+      CloseHandle(old);
+    }
+  }
+  for (const std::wstring& old : {ExePath() + L".old", HubFolder() + L"\\" + kDriverFile + L".old",
+                                  HubFolder() + L"\\" + kFirmwareFile + L".old"}) {
+    DeleteFileW(old.c_str());
+  }
+
   // One hub per user: a second launch just brings the first one forward.
   HANDLE single = nullptr;
   if (snapshot_path.empty()) {
@@ -1379,7 +1870,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   int result;
   {
     App app;
-    result = app.Run(instance, start_in_tray, snapshot_path, view, panel);
+    result = app.Run(instance, start_in_tray, snapshot_path, snapshot_delay_ms, view, panel, after_update != 0);
   }
   CoUninitialize();
   if (single) CloseHandle(single);

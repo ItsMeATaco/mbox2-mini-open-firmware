@@ -1,5 +1,5 @@
 // COM entry points of mbox2asio.dll. DllRegisterServer writes the two keys an ASIO driver needs (an
-// administrator's job: tools\asio\install.ps1 runs regsvr32 on the installed copy):
+// administrator's job: Mbox Hub's DAW card, or tools\asio\install.ps1, runs regsvr32 on the installed copy):
 //   HKCR\CLSID\{5FE5CF79-...}\InprocServer32 = <path of this DLL>, ThreadingModel = Apartment
 //   HKLM\SOFTWARE\ASIO\Mbox 2 Mini (open firmware): CLSID, Description
 #include <windows.h>

@@ -307,6 +307,26 @@ void Ui::Badge(float right, float top, const std::wstring& text, bool attention)
        DWRITE_TEXT_ALIGNMENT_CENTER);
 }
 
+D2D1_RECT_F Ui::SmallButton(float right, float top, const std::wstring& text, bool hover, bool primary, bool enabled,
+                            float height) {
+  const float w = TextWidth(text, small_.Get()) + 24.0f;
+  D2D1_RECT_F button = Rect(right - w, top, right, top + height);
+  UINT32 color = kText;
+  if (!enabled) {
+    Stroke(button, kBorder, 6.0f);
+    color = kTertiary;
+  } else if (primary) {
+    Fill(button, hover ? 0x5BDCC5 : kAccent, 6.0f);
+    color = kBg;
+  } else {
+    if (hover) Fill(button, kHover, 6.0f);
+    Stroke(button, kControl, 6.0f);
+  }
+  const float text_top = top + (height - 18.0f) / 2.0f;
+  Text(text, small_.Get(), Rect(button.left, text_top, button.right, text_top + 18.0f), color, DWRITE_TEXT_ALIGNMENT_CENTER);
+  return button;
+}
+
 void Ui::Card(D2D1_RECT_F rect) {
   Fill(rect, kPanel, 12.0f);
   Stroke(rect, kBorder, 12.0f);
@@ -382,6 +402,13 @@ void Ui::Draw(const UiModel& m, Hit hover) {
 
     float right = cog.left - 8.0f;
     if (!m.rate.empty()) right = Pill(right, y + 12.0f, m.rate, m.rate_kind == 2 ? kAmber : 0, true) - 8.0f;
+    if (!m.update.empty()) {
+      const float left = Pill(right, y + 12.0f, m.update, kAccent, false);
+      const D2D1_RECT_F pill = Rect(left, y + 12.0f, right, y + 42.0f);
+      Stroke(pill, hover == Hit::Update ? kAccent : kControl, 15.0f);
+      SetHit(Hit::Update, pill);
+      right = left - 8.0f;
+    }
     UINT32 dot = m.status_kind == 1 ? kAccent : m.status_kind == 2 ? kAmber : kTertiary;
     const float pills_left = Pill(right, y + 12.0f, m.status, dot, false);
 
@@ -837,8 +864,20 @@ float Ui::DrawDaw(const UiModel& m, Hit hover, float top, float cl, float cr) {
   D2D1_RECT_F card = Rect(cl, top, cr, top + kDawHeight);
   Card(card);
   Text(L"DAW (ASIO)", heading_.Get(), Rect(il, top + 20.0f, ir - 130.0f, top + 42.0f), kText);
-  if (!m.daw_badge.empty()) Badge(ir, top + 19.0f, m.daw_badge, m.daw_path_attention);
-  Text(m.daw_path, small_trimmed_.Get(), Rect(il, top + 52.0f, ir, top + 70.0f), m.daw_path_attention ? kAmber : kTertiary);
+  if (!m.daw_action.empty()) {
+    D2D1_RECT_F button = SmallButton(ir, top + 17.0f, m.daw_action, hover == Hit::DawAction, true, m.daw_action_enabled);
+    if (m.daw_action_enabled) SetHit(Hit::DawAction, button);
+  } else if (!m.daw_badge.empty()) {
+    Badge(ir, top + 19.0f, m.daw_badge, m.daw_path_attention);
+  }
+  float path_right = ir;
+  if (m.daw_remove) {
+    D2D1_RECT_F button = SmallButton(ir, top + 49.0f, L"Remove", hover == Hit::DawRemove, false, true, 22.0f);
+    SetHit(Hit::DawRemove, button);
+    path_right = button.left - 8.0f;
+  }
+  Text(m.daw_path, small_trimmed_.Get(), Rect(il, top + 52.0f, path_right, top + 70.0f),
+       m.daw_path_attention ? kAmber : kTertiary);
 
   constexpr int kCount = static_cast<int>(std::size(kDriverBufferChoices));
   const float sw = (ir - il) / kCount;
