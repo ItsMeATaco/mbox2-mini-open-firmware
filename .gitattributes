@@ -1,0 +1,7 @@
+* text=auto
+# Run on the Raspberry Pi or other Linux hosts: keep LF on every checkout.
+*.sh text eol=lf
+*.py text eol=lf
+*.bin binary
+*.jpg binary
+*.png binary
