@@ -283,10 +283,9 @@ bool FolderWritable(const std::wstring& folder) {
 // bcdDevice 0x0025 -> 25, the image header's version byte for the same firmware.
 int FirmwareNumber(unsigned bcd) { return (bcd >> 8) * 100 + (bcd >> 4 & 15) * 10 + (bcd & 15); }
 
-// The start of a release's notes, cut at a line end, for a message box.
+// The start of a release's notes as plain text, cut at a line end, for a message box.
 std::wstring Excerpt(const std::wstring& notes, size_t limit) {
-  std::wstring text = notes;
-  text.erase(std::remove(text.begin(), text.end(), L'\r'), text.end());
+  const std::wstring text = PlainText(notes);
   if (text.size() <= limit) return text;
   const size_t cut = text.rfind(L'\n', limit);
   return text.substr(0, cut == std::wstring::npos || cut < limit / 2 ? limit : cut) + L"\n\x2026";

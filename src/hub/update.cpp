@@ -290,6 +290,91 @@ int CompareVersions(const std::wstring& a, const std::wstring& b) {
   return 0;
 }
 
+namespace {
+
+std::wstring Trim(const std::wstring& text) {
+  const size_t first = text.find_first_not_of(L" \t");
+  if (first == std::wstring::npos) return {};
+  return text.substr(first, text.find_last_not_of(L" \t") - first + 1);
+}
+
+// Within a line: [text](url) and ![alt](url) keep their text; **, __, * and ` go.
+std::wstring InlineText(const std::wstring& line) {
+  std::wstring out;
+  for (size_t i = 0; i < line.size();) {
+    const bool image = line[i] == L'!' && i + 1 < line.size() && line[i + 1] == L'[';
+    if (line[i] == L'[' || image) {
+      const size_t open = image ? i + 1 : i;
+      const size_t close = line.find(L']', open);
+      if (close != std::wstring::npos && close + 1 < line.size() && line[close + 1] == L'(') {
+        const size_t end = line.find(L')', close);
+        if (end != std::wstring::npos) {
+          out += line.substr(open + 1, close - open - 1);
+          i = end + 1;
+          continue;
+        }
+      }
+    }
+    if (line.compare(i, 2, L"__") == 0) {
+      i += 2;
+      continue;
+    }
+    if (line[i] != L'*' && line[i] != L'`') out += line[i];
+    ++i;
+  }
+  return out;
+}
+
+}  // namespace
+
+std::wstring PlainText(const std::wstring& markdown) {
+  std::wstring out;
+  bool gap = false;  // a blank line is due before the next text
+  for (size_t start = 0; start <= markdown.size();) {
+    size_t end = markdown.find(L'\n', start);
+    if (end == std::wstring::npos) end = markdown.size();
+    std::wstring line = markdown.substr(start, end - start);
+    start = end + 1;
+    if (!line.empty() && line.back() == L'\r') line.pop_back();
+    line = Trim(line);
+    if (line.empty()) {
+      gap = !out.empty();
+      continue;
+    }
+    // Rules (---, ***) and table separator rows (|---|:--:|) carry no words.
+    if ((line.size() >= 3 && line.find_first_not_of(L"-*_ ") == std::wstring::npos) ||
+        (line[0] == L'|' && line.find_first_not_of(L"|-: ") == std::wstring::npos)) {
+      continue;
+    }
+    if (line[0] == L'#') {
+      line = Trim(line.substr(line.find_first_not_of(L'#')));
+    } else if (line[0] == L'>') {
+      line = Trim(line.substr(1));
+    } else if (line.size() > 1 && (line[0] == L'-' || line[0] == L'*' || line[0] == L'+') && line[1] == L' ') {
+      line = L"\x2022 " + Trim(line.substr(2));
+    }
+    if (line[0] == L'|') {
+      // A table row: its cells, separated by a middle dot.
+      std::wstring row;
+      for (size_t cell = 1; cell < line.size();) {
+        size_t bar = line.find(L'|', cell);
+        if (bar == std::wstring::npos) bar = line.size();
+        const std::wstring text = Trim(line.substr(cell, bar - cell));
+        if (!text.empty()) row += (row.empty() ? L"" : L" \x00B7 ") + text;
+        cell = bar + 1;
+      }
+      line = row;
+    }
+    line = InlineText(line);
+    if (line.empty()) continue;
+    if (gap) out += L'\n';
+    gap = false;
+    out += line + L'\n';
+  }
+  while (!out.empty() && out.back() == L'\n') out.pop_back();
+  return out;
+}
+
 Updater::Updater(const std::wstring& user_agent, std::function<void()> changed) : changed_(std::move(changed)) {
   session_ = WinHttpOpen(user_agent.c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
                          WINHTTP_NO_PROXY_BYPASS, 0);

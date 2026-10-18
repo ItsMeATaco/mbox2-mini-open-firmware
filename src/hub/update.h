@@ -39,6 +39,10 @@ struct Release {
 // <0, 0 or >0 as a is older, the same or newer, comparing the dotted numbers in "v1.2.3" or "1.2".
 int CompareVersions(const std::wstring& a, const std::wstring& b);
 
+// A release's notes (GitHub Markdown) as plain text for a message box: headings, emphasis, code marks, links,
+// quotes, rules and table pipes reduced to their words, list items to bullets.
+std::wstring PlainText(const std::wstring& markdown);
+
 class Updater {
  public:
   enum class State { Idle, Checking, Checked, Downloading, Downloaded, Failed };
