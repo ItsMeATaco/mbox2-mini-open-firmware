@@ -54,6 +54,8 @@ struct UiModel {
   std::wstring tile_value[4];
   std::wstring tile_sub[4];
   bool tile_attention[4] = {};
+  std::wstring reset_label;    // the converter reset's button beside the main panel's controls; empty hides it
+  bool reset_enabled = false;
 
   // Firmware card
   std::wstring fw_installed;   // badge, e.g. "v0.22 installed"; empty hides it
@@ -117,6 +119,7 @@ enum class Hit {
   ViewSpectrum,
   ViewPhase,
   ResetLoudness,
+  ResetConverters,
   SourceOutput,
   SourceInputs,
   Smoothing6,

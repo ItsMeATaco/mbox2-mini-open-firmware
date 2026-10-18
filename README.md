@@ -49,6 +49,8 @@ small memory chip on the board at power-up. Replace that firmware and the driver
 - Live input and output meters with peak hold and clip lights.
 - Loudness (EBU R128 / LUFS, true peak, loudness range), spectrum and stereo phase analysis.
 - Health at a glance: clock lock, dropouts and USB packet gaps, with a dropout log and tray notifications.
+- **Reset converters** (firmware v0.27 and later, in the window and the tray menu): restarts the Mbox's DAC
+  and ADC in about 40 ms, a first thing to try before replugging when the sound or the inputs go wrong.
 - Checks GitHub for new releases, updates itself in one click, and installs new firmware over USB.
 - Installs, updates and removes the ASIO driver, and sets its buffer size.
 - Starts with Windows in the tray if you want it to. Uses about 0.5 % CPU there.

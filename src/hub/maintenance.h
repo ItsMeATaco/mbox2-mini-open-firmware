@@ -22,6 +22,10 @@ class MaintenanceLink {
   static constexpr uint8_t kPoke = 0x02;      // no data: low byte of wIndex to external data address wValue
   static constexpr uint8_t kClockStat = 0x09; // IN, 12 bytes: frame number, MCLK capture, N trim, lock phase,
                                                // sample rate (24 bits), streams; all LE (up to v0.23: the first 8)
+  static constexpr uint8_t kConvReset = 0x0C; // no data, v0.27+: resets the converters in wValue (kConvDac,
+                                               // kConvAdc), outputs off meanwhile; sound returns about 40 ms later
+  static constexpr uint16_t kConvDac = 1, kConvAdc = 2;
+  static constexpr uint16_t kConvResetFirmware = 0x0027;  // bcdDevice of the first firmware that takes kConvReset
 
   MaintenanceLink() = default;
   MaintenanceLink(const MaintenanceLink&) = delete;

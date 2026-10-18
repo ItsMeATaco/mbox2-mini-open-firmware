@@ -22,6 +22,10 @@ struct FirmwareImage {
   uint16_t size = 0;           // payload bytes
   uint16_t checksum = 0;
   bool avid = false;           // Avid's own firmware (a backup of the original chip), not the open firmware
+
+  // Whether the Mbox needs a replug after the reboot that ends an install. From v0.27 the open firmware holds
+  // the DAC in reset until its clocks run; older images left its right channel silent after every reboot.
+  bool NeedsReplug() const { return avid || version < 27; }
 };
 
 // Reads and checks an image file. Returns an empty string if it's valid, else what's wrong with it.

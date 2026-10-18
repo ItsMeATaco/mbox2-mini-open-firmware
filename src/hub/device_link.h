@@ -49,6 +49,13 @@ class DeviceLink {
     int done = 0, total = 0;
     std::string error;
     uint8_t version = 0;  // image version being or last installed
+    bool replug = true;   // that image needs a replug after its reboot (FirmwareImage::NeedsReplug)
+  };
+
+  struct ConverterReset {
+    uint32_t count = 0;  // resets sent (or tried) since the hub started
+    bool adc = false;    // the last one included the ADC
+    std::string error;   // why the last one failed; empty if it worked
   };
 
   struct Status {
@@ -91,6 +98,11 @@ class DeviceLink {
     uint32_t dropouts = 0;         // since the hub started
     std::vector<Dropout> recent;   // newest last
 
+    // Converter resets (vendor request 0x0C, firmware v0.27+).
+    bool can_reset = false;  // the firmware takes it, the maintenance interface is up and no install runs
+    bool reset_adc = false;  // a reset now would include the ADC (see ResetConverters)
+    ConverterReset reset;
+
     Install install;
   };
 
@@ -105,6 +117,11 @@ class DeviceLink {
 
   // Installs an image (validated with LoadFirmwareImage) on the link's thread; false if one is running.
   bool StartInstall(FirmwareImage image);
+
+  // Resets the Mbox's converters on the link's thread: the DAC, and the ADC too once the Mbox has been connected
+  // for 15 s (an ADC reset sooner after power-up leaves input 2 pinned for about 8 s). False unless
+  // status.can_reset. The outcome lands in status.reset.
+  bool ResetConverters();
 
  private:
   struct ClockSample {
@@ -128,7 +145,8 @@ class DeviceLink {
   void Run();
   void Poll();
   void RunInstall();
-  void ScanPnp(Status* status);
+  void RunConverterReset();
+  void ScanPnp(Status* status, uint64_t* arrival);  // arrival: Windows' last arrival time of the Mbox, or 0
   void TakeClock(const uint8_t* reply, ULONG length, LARGE_INTEGER now);  // 8 bytes (up to v0.23) or 12
   void ReadWindowsRates();
   void TakeCounters(const std::wstring& text, LARGE_INTEGER now, bool playing);
@@ -160,10 +178,13 @@ class DeviceLink {
   uint64_t audio_service_ = 0;  // AudioServiceInstance() when the two above were made
   Maintenance last_maintenance_ = Maintenance::Missing;
   Presence last_presence_ = Presence::Absent;
+  bool polled_ = false;
+  uint64_t connected_at_ = 0;  // when the Mbox last connected, as a FILETIME (UTC)
 
   mutable std::mutex mutex_;
   Status status_;
   bool install_pending_ = false;
+  bool reset_pending_ = false;
   ULONGLONG install_finished_ = 0;
   FirmwareImage pending_image_;
 };

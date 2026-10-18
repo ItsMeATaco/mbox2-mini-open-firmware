@@ -20,9 +20,14 @@ constexpr double kMclkPerSample = 256.0;  // MCLK = 256 x the sample rate: 12288
 const PROPERTYKEY kDeviceFormatKey = {{0xf19f064d, 0x082c, 0x4e27, {0xbc, 0x73, 0x68, 0x82, 0xa1, 0xbb, 0x8e, 0x4c}}, 0};
 constexpr size_t kMaxRecent = 50;
 constexpr size_t kHistory = 30;
-// After an install the Mbox reboots, which unplugs it from USB for a moment; only an absence after this
-// long is the replug the install asks for.
+// Windows' arrival time of a device: DEVPKEY_Device_LastArrivalDate, a FILETIME.
+const DEVPROPKEY kLastArrivalKey = {{0x83da6326, 0x97a6, 0x4088, {0x94, 0x53, 0xa1, 0x92, 0x3f, 0x57, 0x3b, 0x29}}, 102};
+// After an install the Mbox reboots, which unplugs it from USB for a moment; by this long after the install it
+// is back. An absence after that is a replug (which an image before v0.27 asks for) or an unplug.
 constexpr ULONGLONG kRebootGraceMs = 15000;
+// How long after the Mbox connects a converter reset may include the ADC. Sooner after power-up an ADC reset
+// left input 2 pinned for about 8 s (firmware/src/audio.c).
+constexpr uint64_t kAdcResetDelay = 15ull * 10000000;  // FILETIME units
 
 // Dropout rule. Measured 2026-10-16 with playback running: "frames with no packet seen" rises with every
 // control request, whatever it asks (about 0.45 per SETUP and per 8-byte packet: 5 for a read of string
@@ -59,6 +64,24 @@ bool DevnodeOk(DEVINST devinst, ULONG* problem) {
     return false;
   }
   return true;
+}
+
+uint64_t SystemNow() {
+  FILETIME now;
+  GetSystemTimeAsFileTime(&now);
+  return static_cast<uint64_t>(now.dwHighDateTime) << 32 | now.dwLowDateTime;
+}
+
+uint64_t LastArrival(DEVINST devinst) {
+  DEVPROPTYPE type = 0;
+  FILETIME time{};
+  ULONG size = sizeof time;
+  if (CM_Get_DevNode_PropertyW(devinst, &kLastArrivalKey, &type, reinterpret_cast<PBYTE>(&time), &size, 0) !=
+          CR_SUCCESS ||
+      type != DEVPROP_TYPE_FILETIME) {
+    return 0;
+  }
+  return static_cast<uint64_t>(time.dwHighDateTime) << 32 | time.dwLowDateTime;
 }
 
 // bcdDevice from the hardware IDs' REV_xxxx.
@@ -143,6 +166,18 @@ bool DeviceLink::StartInstall(FirmwareImage image) {
     status_.install.state = Install::State::Running;
     status_.install.stage = "Starting";
     status_.install.version = pending_image_.version;
+    status_.install.replug = pending_image_.NeedsReplug();
+    status_.can_reset = false;
+  }
+  SetEvent(wake_event_);
+  return true;
+}
+
+bool DeviceLink::ResetConverters() {
+  {
+    std::lock_guard lock(mutex_);
+    if (!status_.can_reset || reset_pending_ || install_pending_) return false;
+    reset_pending_ = true;
   }
   SetEvent(wake_event_);
   return true;
@@ -159,14 +194,16 @@ double DeviceLink::Seconds(LARGE_INTEGER from, LARGE_INTEGER to) const {
 void DeviceLink::Run() {
   CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   for (;;) {
-    bool install;
+    bool install, reset;
     {
       std::lock_guard lock(mutex_);
       install = install_pending_;
+      reset = reset_pending_;
     }
     if (install) {
       RunInstall();
     } else {
+      if (reset) RunConverterReset();
       Poll();
     }
     HANDLE events[2] = {stop_event_, wake_event_};
@@ -175,7 +212,8 @@ void DeviceLink::Run() {
   CoUninitialize();
 }
 
-void DeviceLink::ScanPnp(Status* s) {
+void DeviceLink::ScanPnp(Status* s, uint64_t* arrival) {
+  *arrival = 0;
   s->presence = Presence::Absent;
   s->instance.clear();
   s->firmware = 0;
@@ -207,6 +245,7 @@ void DeviceLink::ScanPnp(Status* s) {
   if (s->presence != Presence::OpenFirmware) return;
 
   s->firmware = FirmwareRevision(device);
+  *arrival = LastArrival(device);
   bool found_audio = false;
   DEVINST child = 0;
   for (CONFIGRET cr = CM_Get_Child(&child, device, 0); cr == CR_SUCCESS; cr = CM_Get_Sibling(&child, child, 0)) {
@@ -225,7 +264,8 @@ void DeviceLink::ScanPnp(Status* s) {
 
 void DeviceLink::Poll() {
   Status pnp;
-  ScanPnp(&pnp);
+  uint64_t arrival = 0;
+  ScanPnp(&pnp, &arrival);
   LARGE_INTEGER now;
   QueryPerformanceCounter(&now);
 
@@ -243,14 +283,26 @@ void DeviceLink::Poll() {
     s.audio_problem = pnp.audio_problem;
     s.maintenance = pnp.maintenance;
     s.maintenance_problem = pnp.maintenance_problem;
+    const bool rebooting = GetTickCount64() - install_finished_ < kRebootGraceMs;
     if (pnp.presence != Presence::OpenFirmware) {
       s.clock_valid = s.counters_valid = s.streaming = false;
-      // The replug that the end of an install asks for.
-      bool rebooting = GetTickCount64() - install_finished_ < kRebootGraceMs;
+      // An unplug, or the replug that an image before v0.27 asks for, ends the install's message.
       if ((s.install.state == Install::State::Done && !rebooting) || s.install.state == Install::State::Failed) {
         s.install = {};
       }
+    } else if (s.install.state == Install::State::Done && !s.install.replug && (arrived || !rebooting)) {
+      s.install = {};  // back from the install's reboot: that's all v0.27+ needs
     }
+
+    // When the Mbox connected: Windows' arrival time if the hub found it already there, else when the hub saw
+    // it arrive (the later of the two, in case Windows' time lags).
+    if (arrived) connected_at_ = polled_ || !arrival ? SystemNow() : arrival;
+    connected_at_ = std::max(connected_at_, arrival);
+    polled_ = true;
+    s.can_reset = pnp.presence == Presence::OpenFirmware && pnp.firmware >= MaintenanceLink::kConvResetFirmware &&
+                  pnp.maintenance == Maintenance::Ready && s.install.state != Install::State::Running &&
+                  !(s.install.state == Install::State::Done && rebooting) && !install_pending_;
+    s.reset_adc = SystemNow() - connected_at_ >= kAdcResetDelay;
   }
   if (arrived || left) {
     EndRun();
@@ -637,11 +689,47 @@ void DeviceLink::RunInstall() {
     status_.install.error = error;
     install_finished_ = GetTickCount64();
   }
-  log_(error.empty() ? "Firmware installed and the Mbox rebooted; it needs a replug before listening"
-                     : "Firmware install failed: " + error);
+  log_(!error.empty()           ? "Firmware install failed: " + error
+       : image.NeedsReplug() ? "Firmware installed and the Mbox rebooted; it needs a replug before listening"
+                             : "Firmware installed and the Mbox rebooted into it");
   // The counters were disturbed by the install's own traffic, and the Mbox restarts.
   have_clock_ = have_counters_ = false;
   run_ = {};
   missed_history_.clear();
+  Changed();
+}
+
+// The firmware sets the reset lines and answers at once; the converters are back about 40 ms later (20 ms held,
+// then 20 ms before the outputs come on), counted in SOFs.
+void DeviceLink::RunConverterReset() {
+  {
+    std::lock_guard lock(mutex_);
+    reset_pending_ = false;
+  }
+  const bool adc = SystemNow() - connected_at_ >= kAdcResetDelay;
+  MaintenanceLink link;
+  DWORD error = link.Open();
+  // Another hub's once-a-second poll holds the interface for a few milliseconds at a time.
+  for (int attempt = 0;
+       attempt < 10 && (error == ERROR_ACCESS_DENIED || error == ERROR_SHARING_VIOLATION || error == ERROR_BUSY);
+       ++attempt) {
+    Sleep(20);
+    error = link.Open();
+  }
+  if (!error) {
+    error = link.ControlOut(MaintenanceLink::kConvReset,
+                            MaintenanceLink::kConvDac | (adc ? MaintenanceLink::kConvAdc : 0), 0);
+  }
+  link.Close();
+  const std::string text = error ? Win32Text(error) : "";
+  {
+    std::lock_guard lock(mutex_);
+    ++status_.reset.count;
+    status_.reset.adc = adc;
+    status_.reset.error = text;
+  }
+  log_(error ? "Resetting the converters failed: " + text
+       : adc ? "Converters reset (DAC and ADC)"
+             : "DAC reset (the ADC is left alone until the Mbox has been connected for 15 s)");
   Changed();
 }

@@ -82,7 +82,15 @@ constexpr float kPeakHoldSeconds = 1.5f;
 constexpr float kPeakFallDbPerSecond = 20.0f;
 constexpr float kClipLevel = 0.9886f;  // -0.1 dBFS
 
-enum MenuId : UINT { kMenuOpen = 1, kMenuStartup, kMenuLog, kMenuCheckUpdates, kMenuAutoUpdates, kMenuQuit };
+enum MenuId : UINT {
+  kMenuOpen = 1,
+  kMenuStartup,
+  kMenuLog,
+  kMenuResetConverters,
+  kMenuCheckUpdates,
+  kMenuAutoUpdates,
+  kMenuQuit
+};
 
 std::wstring LocalAppDataDir() {
   PWSTR base = nullptr;
@@ -390,6 +398,7 @@ class App {
   void SetImage(const std::wstring& path);
   void CheckImageFile();
   void Install();
+  void ResetConverters();
   void RefreshDriver();
   void SetDriverBuffer(int frames);
   void RunElevated(const std::wstring& arguments, const wchar_t* doing);
@@ -468,6 +477,7 @@ class App {
   FirmwareImage image_;
   std::string image_problem_;
   DeviceLink::Install::State install_state_ = DeviceLink::Install::State::Idle;
+  uint32_t reset_count_ = 0;  // converter resets already reported
 
   // Analysis views
   View view_ = View::Levels;
@@ -726,6 +736,9 @@ LRESULT App::Handle(UINT message, WPARAM wparam, LPARAM lparam) {
         case kMenuLog:
           OpenLog();
           break;
+        case kMenuResetConverters:
+          ResetConverters();
+          break;
         case kMenuCheckUpdates:
           CheckForUpdates(true);
           break;
@@ -763,10 +776,15 @@ void App::OnChanged() {
   if (state != install_state_) {
     install_state_ = state;
     if (state == State::Done) {
-      std::wstring text = L"Firmware " + Version(status_.install.version) +
-                          L" is installed and the Mbox rebooted into it. Unplug the Mbox and plug it back in "
-                          L"before listening: a reboot can leave its DAC stuck.";
-      Notify(L"Replug the Mbox", text);
+      std::wstring text =
+          L"Firmware " + Version(status_.install.version) + L" is installed and the Mbox rebooted into it.";
+      if (status_.install.replug) {
+        text += L" Unplug the Mbox and plug it back in before listening: a reboot can leave its DAC stuck.";
+        Notify(L"Replug the Mbox", text);
+      } else {
+        text += L" Sound is back once Windows has found it again, in a few seconds.";
+        Notify(L"Firmware installed", text);
+      }
       if (Visible()) MessageBoxW(hwnd_, text.c_str(), kTitle, MB_OK | MB_ICONINFORMATION);
     } else if (state == State::Failed) {
       std::wstring text = L"The firmware install failed: " + Widen(status_.install.error) +
@@ -774,6 +792,17 @@ void App::OnChanged() {
                           L"it comes up in TI's boot mode and the Raspberry Pi has to write it.";
       Notify(L"Firmware install failed", Widen(status_.install.error));
       if (Visible()) MessageBoxW(hwnd_, text.c_str(), kTitle, MB_OK | MB_ICONERROR);
+    }
+  }
+  if (status_.reset.count != reset_count_) {
+    reset_count_ = status_.reset.count;
+    if (!status_.reset.error.empty()) {
+      Notify(L"Converter reset failed", Widen(status_.reset.error));
+    } else if (status_.reset.adc) {
+      Notify(L"Audio converters reset", L"The Mbox reset its DAC and ADC; sound is back within 40 ms.");
+    } else {
+      Notify(L"DAC reset", L"The Mbox reset its DAC; sound is back within 40 ms. The inputs' ADC can be reset too "
+                           L"once the Mbox has been connected for 15 s.");
     }
   }
   UpdateModel();
@@ -977,6 +1006,13 @@ void App::UpdateModel() {
     model_.tile_sub[3] = L"nothing playing to it";
   }
 
+  // ---- Converter reset (firmware v0.27+): the DAC alone until the Mbox has been connected for 15 s
+  model_.reset_label.clear();
+  if (open && s.firmware >= MaintenanceLink::kConvResetFirmware) {
+    model_.reset_label = s.reset_adc ? L"Reset converters" : L"Reset DAC";
+  }
+  model_.reset_enabled = s.can_reset;
+
   // ---- Firmware
   model_.fw_installed = open ? Bcd(s.firmware) + L" installed" : L"";
   model_.fw_image = FileName(image_path_);
@@ -996,10 +1032,12 @@ void App::UpdateModel() {
   model_.fw_note_kind = 0;
   if (model_.fw_busy) {
     model_.fw_note = Widen(s.install.stage) + Printf(L" \x00B7 %d%%", s.install.total ? s.install.done * 100 / s.install.total : 0);
-  } else if (s.install.state == State::Done) {
+  } else if (s.install.state == State::Done && s.install.replug) {
     model_.fw_note = L"Installed " + Version(s.install.version) + L". Unplug the Mbox and plug it back in before "
                      L"listening: a reboot can leave the DAC stuck.";
     model_.fw_note_kind = 2;
+  } else if (s.install.state == State::Done) {
+    model_.fw_note = L"Installed " + Version(s.install.version) + L". The Mbox restarts into it; no replug needed.";
   } else if (s.install.state == State::Failed) {
     model_.fw_note = L"Failed: " + Widen(s.install.error) + L" Keep the Mbox plugged in and try again.";
     model_.fw_note_kind = 3;
@@ -1021,10 +1059,14 @@ void App::UpdateModel() {
                      L"reach it.";
     model_.fw_note_kind = 2;
   } else if (model_.fw_image_ok && image_.version == installed) {
-    model_.fw_note = L"Same version as installed. Takes about 30 s; replug the Mbox afterwards.";
+    model_.fw_note = image_.NeedsReplug() ? L"Same version as installed. Takes about 30 s; replug the Mbox afterwards."
+                                          : L"Same version as installed. Takes about 30 s.";
   } else if (model_.fw_image_ok && image_.version > installed) {
-    model_.fw_note = L"Newer than the Mbox's " + Bcd(s.firmware) + L". Takes about 30 s; replug the Mbox afterwards.";
+    model_.fw_note = L"Newer than the Mbox's " + Bcd(s.firmware) + L". Takes about 30 s" +
+                     (image_.NeedsReplug() ? L"; replug the Mbox afterwards." : L".");
     model_.fw_note_kind = 2;
+  } else if (model_.fw_image_ok && !image_.NeedsReplug()) {
+    model_.fw_note = L"Takes about 30 s; sound stops for a few seconds while the Mbox reboots.";
   } else {
     model_.fw_note = L"Takes about 30 s; sound stops when the Mbox reboots. Replug it afterwards.";
   }
@@ -1163,7 +1205,8 @@ void App::UpdateModel() {
 
   // An install's progress or outcome, a broken or outdated driver, or newer firmware puts a dot on the closed cog.
   model_.side_open = side_open_;
-  model_.side_attention = model_.fw_busy || s.install.state == State::Done || s.install.state == State::Failed ||
+  model_.side_attention = model_.fw_busy || (s.install.state == State::Done && s.install.replug) ||
+                          s.install.state == State::Failed ||
                           (driver_.state != Driver::Installed && driver_.state != Driver::NotInstalled) ||
                           (driver_.state == Driver::Installed && !driver_current_ && can_install) ||
                           (model_.fw_image_ok && !image_.avid && installed >= 0 && image_.version > installed);
@@ -1193,6 +1236,9 @@ void App::Click(Hit hit) {
       break;
     case Hit::Install:
       Install();
+      break;
+    case Hit::ResetConverters:
+      ResetConverters();
       break;
     case Hit::OpenLog:
       OpenLog();
@@ -1305,7 +1351,9 @@ void App::Install() {
   std::wstring text = L"Install firmware " + Version(image_.version) + L" on the Mbox?\n\n" + FileName(image_path_) +
                       L", " + Grouped(image_.size) + L" bytes of code, replacing " + Bcd(status_.firmware) +
                       L".\n\nIt takes about 30 seconds. Keep the Mbox plugged in until the hub says it's done. Sound "
-                      L"may crackle while it writes and stops when the Mbox reboots; then unplug and replug it.";
+                      L"may crackle while it writes and " +
+                      (image_.NeedsReplug() ? L"stops when the Mbox reboots; then unplug and replug it."
+                                            : L"stops for a few seconds while the Mbox reboots.");
   if (image_.avid) {
     text = L"Put Avid's firmware " + Version(image_.version) + L" back on the Mbox?\n\n" + FileName(image_path_) +
            L" replaces the open firmware " + Bcd(status_.firmware) +
@@ -1319,6 +1367,11 @@ void App::Install() {
     log_.Write("Install requested: " + Narrow(image_path_));
   }
   OnChanged();
+}
+
+// Vendor request 0x0C, for a silent output or stuck inputs: the outcome comes back as a notification.
+void App::ResetConverters() {
+  if (link_.ResetConverters()) log_.Write("Converter reset requested");
 }
 
 void App::RefreshDriver() {
@@ -1773,6 +1826,11 @@ void App::TrayMenu() {
   AppendMenuW(menu, MF_STRING, kMenuOpen, L"Open Mbox Hub");
   AppendMenuW(menu, MF_STRING | (startup ? MF_CHECKED : 0), kMenuStartup, L"Start with Windows");
   AppendMenuW(menu, MF_STRING, kMenuLog, L"Open dropout log");
+  if (status_.presence == DeviceLink::Presence::OpenFirmware &&
+      status_.firmware >= MaintenanceLink::kConvResetFirmware) {
+    AppendMenuW(menu, MF_STRING | (status_.can_reset ? 0 : MF_GRAYED), kMenuResetConverters,
+                status_.reset_adc ? L"Reset audio converters" : L"Reset audio output (DAC)");
+  }
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, (std::wstring(L"Mbox Hub v") + kHubVersion).c_str());
   AppendMenuW(menu, MF_STRING | (updater_.Busy() ? MF_GRAYED : 0), kMenuCheckUpdates, L"Check for updates now");

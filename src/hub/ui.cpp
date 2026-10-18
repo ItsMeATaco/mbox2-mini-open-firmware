@@ -508,8 +508,10 @@ void Ui::DrawMain(const UiModel& m, Hit hover, D2D1_RECT_F panel) {
   Card(panel);
   const float x = panel.left + 20.0f, right = panel.right - 20.0f;
   static const wchar_t* const kTabs[] = {L"Levels", L"Loudness", L"Spectrum", L"Phase"};
-  Segmented(x, panel.top + 14.0f, 34.0f, kTabs, 4, static_cast<int>(m.view), Hit::ViewLevels, hover, body_.Get());
+  const float tabs_right = x + Segmented(x, panel.top + 14.0f, 34.0f, kTabs, 4, static_cast<int>(m.view),
+                                         Hit::ViewLevels, hover, body_.Get());
 
+  float controls_left;
   if (m.view == View::Levels || m.view == View::Loudness) {
     std::wstring label = m.view == View::Levels ? L"Reset clip lights" : L"Reset";
     Hit hit = m.view == View::Levels ? Hit::ResetClips : Hit::ResetLoudness;
@@ -517,9 +519,21 @@ void Ui::DrawMain(const UiModel& m, Hit hover, D2D1_RECT_F panel) {
     D2D1_RECT_F button = Rect(right - bw, panel.top + 14.0f, right, panel.top + 48.0f);
     Button(button, label, hover == hit);
     SetHit(hit, button);
+    controls_left = button.left;
   } else {
     static const wchar_t* const kSources[] = {L"Output", L"In 1/2"};
-    Segmented(right, panel.top + 14.0f, 34.0f, kSources, 2, m.source, Hit::SourceOutput, hover, body_.Get(), true);
+    controls_left = right - Segmented(right, panel.top + 14.0f, 34.0f, kSources, 2, m.source, Hit::SourceOutput,
+                                      hover, body_.Get(), true);
+  }
+  // The converter reset, where it fits between the tabs and the view's own control.
+  if (!m.reset_label.empty()) {
+    const float bw = TextWidth(m.reset_label, body_.Get()) + 28.0f;
+    const float br = controls_left - 8.0f;
+    const D2D1_RECT_F button = Rect(br - bw, panel.top + 14.0f, br, panel.top + 48.0f);
+    if (button.left >= tabs_right + 12.0f) {
+      Button(button, m.reset_label, hover == Hit::ResetConverters, m.reset_enabled);
+      if (m.reset_enabled) SetHit(Hit::ResetConverters, button);
+    }
   }
 
   const float tiles_top = panel.bottom - 20.0f - 78.0f;
