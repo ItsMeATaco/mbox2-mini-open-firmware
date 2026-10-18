@@ -4,7 +4,8 @@
 
 #include <algorithm>
 #include <cstring>
-#include <cwctype>
+
+#include "hub/usb_ids.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -13,22 +14,21 @@ namespace {
 constexpr REFERENCE_TIME kCaptureBuffer = 5000000;  // 500 ms: drained every UI frame (33 ms)
 
 // An endpoint's device node is SWD\MMDEVAPI\<endpoint id>; its parent is the audio function it belongs
-// to, which for the Mbox is interface 0 of the USB device.
+// to, which for the Mbox is interface 0 of the USB device, and that interface's parent the USB device.
 bool IsMboxEndpoint(IMMDevice* device) {
   LPWSTR id = nullptr;
   if (FAILED(device->GetId(&id))) return false;
   std::wstring instance = L"SWD\\MMDEVAPI\\" + std::wstring(id);
   CoTaskMemFree(id);
-  DEVINST endpoint = 0, parent = 0;
+  DEVINST endpoint = 0, function = 0, usb_device = 0;
   if (CM_Locate_DevNodeW(&endpoint, instance.data(), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS ||
-      CM_Get_Parent(&parent, endpoint, 0) != CR_SUCCESS) {
+      CM_Get_Parent(&function, endpoint, 0) != CR_SUCCESS) {
     return false;
   }
-  wchar_t parent_id[MAX_DEVICE_ID_LEN] = {};
-  if (CM_Get_Device_IDW(parent, parent_id, MAX_DEVICE_ID_LEN, 0) != CR_SUCCESS) return false;
-  std::wstring upper = parent_id;
-  for (auto& c : upper) c = static_cast<wchar_t>(std::towupper(c));
-  return upper.rfind(L"USB\\VID_1209&PID_0001&MI_00\\", 0) == 0;
+  wchar_t function_id[MAX_DEVICE_ID_LEN] = {};
+  return CM_Get_Device_IDW(function, function_id, MAX_DEVICE_ID_LEN, 0) == CR_SUCCESS &&
+         HasOpenFirmwareId(function_id, 0) && CM_Get_Parent(&usb_device, function, 0) == CR_SUCCESS &&
+         IsOpenFirmwareMbox(usb_device);
 }
 
 bool Active(IMMDevice* device) {

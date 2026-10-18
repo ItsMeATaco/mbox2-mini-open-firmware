@@ -24,7 +24,7 @@ class DeviceLink {
  public:
   enum class Presence {
     Absent,
-    OpenFirmware,  // USB 1209:0001, the open USB Audio Class firmware
+    OpenFirmware,  // the open USB Audio Class firmware: one of kOpenFirmwareIds and its name (hub/usb_ids.h)
     AvidFirmware,  // USB 0DBA:3000, Avid's firmware
     BootRom,       // USB 0451:3200, TI's boot ROM: the EEPROM has no valid image
   };

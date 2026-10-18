@@ -11,6 +11,10 @@ set -euo pipefail
 REPO=ItsMeATaco/mbox2-mini-open-firmware
 RAW=https://raw.githubusercontent.com/$REPO/main/pi
 FIRMWARE_URL=https://github.com/$REPO/releases/latest/download/mbox2-open.bin
+# The open firmware's USB IDs (vendor:product, lower case as in sysfs), every one a release has used.
+# 1209:0001 is pid.codes' shared test ID, which other test gadgets carry too, so mbox_state also checks the
+# product name. Add the firmware's own PID here once pid.codes grants it (requested: 1209:4d32).
+OPEN_IDS=(1209:0001)
 
 usage() {
   cat <<'EOF'
@@ -34,6 +38,12 @@ home=$(getent passwd "$owner" | cut -d: -f6)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
+is_open_id() {
+  local open
+  for open in "${OPEN_IDS[@]}"; do [[ $1 == "$open" ]] && return 0; done
+  return 1
+}
+
 # How the Mbox shows up on the Pi's USB: "open <bcdDevice>", "avid", "rom" or "none".
 mbox_state() {
   local d id
@@ -41,10 +51,10 @@ mbox_state() {
     [[ -f $d/idVendor ]] || continue
     id="$(<"$d/idVendor"):$(<"$d/idProduct")"
     case $id in
-      1209:0001) grep -qi mbox "$d/product" 2>/dev/null && { echo "open $(<"$d/bcdDevice")"; return; } ;;
       0dba:3000) echo avid; return ;;
       0451:3200) echo rom; return ;;
     esac
+    if is_open_id "$id" && grep -qi mbox "$d/product" 2>/dev/null; then echo "open $(<"$d/bcdDevice")"; return; fi
   done
   echo none
 }
@@ -62,10 +72,12 @@ describe() {
 # What a TUSB3200 image holds, from its USB device descriptor and header version byte:
 # "open 0.25", "avid 1.40" or "unknown".
 image_kind() {
-  python3 - "$1" <<'EOF'
+  python3 - "$1" "${OPEN_IDS[@]}" <<'EOF'
 import sys
 d = open(sys.argv[1], "rb").read()
-kind = "open" if b"\x09\x12\x01\x00" in d else "avid" if b"\xba\x0d\x00\x30" in d else "unknown"
+# idVendor and idProduct as the device descriptor holds them: little-endian.
+open_ids = [b"".join(int(x, 16).to_bytes(2, "little") for x in i.split(":")) for i in sys.argv[2:]]
+kind = "open" if any(i in d for i in open_ids) else "avid" if b"\xba\x0d\x00\x30" in d else "unknown"
 print(kind, f"{d[5] // 100}.{d[5] % 100:02d}" if len(d) > 5 else "")
 EOF
 }

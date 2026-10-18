@@ -9,6 +9,7 @@
 #include <cwctype>
 
 #include "hub/meters.h"
+#include "hub/usb_ids.h"
 
 namespace {
 
@@ -188,13 +189,16 @@ void DeviceLink::ScanPnp(Status* s) {
   if (CM_Get_Device_ID_List_SizeW(&length, L"USB", flags) != CR_SUCCESS || length <= 1) return;
   std::wstring list(length, L'\0');
   if (CM_Get_Device_ID_ListW(L"USB", list.data(), length, flags) != CR_SUCCESS) return;
+  DEVINST device = 0;
   for (const wchar_t* id = list.c_str(); *id; id += wcslen(id) + 1) {
     std::wstring upper = Upper(id);
     if (upper.rfind(L"USB\\VID_0DBA&PID_3000\\", 0) == 0 && s->presence == Presence::Absent) {
       s->presence = Presence::AvidFirmware;
     } else if (upper.rfind(L"USB\\VID_0451&PID_3200\\", 0) == 0 && s->presence == Presence::Absent) {
       s->presence = Presence::BootRom;
-    } else if (upper.rfind(L"USB\\VID_1209&PID_0001\\", 0) == 0) {
+    } else if (HasOpenFirmwareId(upper) &&
+               CM_Locate_DevNodeW(&device, const_cast<wchar_t*>(id), CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS &&
+               IsOpenFirmwareMbox(device)) {  // not another gadget on pid.codes' shared test ID
       s->presence = Presence::OpenFirmware;
       s->instance = id;
       break;
@@ -202,8 +206,6 @@ void DeviceLink::ScanPnp(Status* s) {
   }
   if (s->presence != Presence::OpenFirmware) return;
 
-  DEVINST device = 0;
-  if (CM_Locate_DevNodeW(&device, s->instance.data(), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS) return;
   s->firmware = FirmwareRevision(device);
   bool found_audio = false;
   DEVINST child = 0;

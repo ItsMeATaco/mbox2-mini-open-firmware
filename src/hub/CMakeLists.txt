@@ -9,6 +9,7 @@ add_executable(mbox2hub WIN32
   meters.cpp
   ui.cpp
   update.cpp
+  usb_ids.cpp
 )
 target_include_directories(mbox2hub PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_compile_definitions(mbox2hub PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS

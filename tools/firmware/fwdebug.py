@@ -26,7 +26,10 @@ import statistics
 import sys
 import time
 
-VID, PID = 0x1209, 0x0001
+# The open firmware's USB IDs (src/hub/usb_ids.h). 1209:0001 is pid.codes' shared test ID, so the product
+# name is checked too.
+OPEN_IDS = [(0x1209, 0x0001)]
+PRODUCT = "Mbox 2 Mini"
 VREQ_PEEK, VREQ_POKE, VREQ_PORTS, VREQ_SET_PORT, VREQ_CLOCK, VREQ_CODEC, VREQ_MCLK, VREQ_CPTRAW = 1, 2, 3, 4, 5, 6, 7, 8
 VREQ_CLKSTAT, VREQ_LOCK, VREQ_DMAMODE = 9, 10, 11
 
@@ -44,12 +47,12 @@ def find_device():
     for path in glob.glob("/sys/bus/usb/devices/*"):
         try:
             ids = (int(open(f"{path}/idVendor").read(), 16), int(open(f"{path}/idProduct").read(), 16))
-            if ids == (VID, PID):
+            if ids in OPEN_IDS and open(f"{path}/product").read().strip() == PRODUCT:
                 bus, dev = int(open(f"{path}/busnum").read()), int(open(f"{path}/devnum").read())
                 return f"/dev/bus/usb/{bus:03d}/{dev:03d}"
         except OSError:
             continue
-    sys.exit("the Mbox with the open firmware (1209:0001) isn't on USB")
+    sys.exit("the Mbox with the open firmware isn't on USB")
 
 
 class Mbox:
