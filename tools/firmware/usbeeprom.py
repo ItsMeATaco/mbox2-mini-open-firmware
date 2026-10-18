@@ -208,9 +208,14 @@ def install(i2c, path, reboot=True):
             i2c.m.control(0x80, 6, 0x0300 | 0x4F, 0x0409, 64)  # diag string 0x4F: reboot
         except OSError:
             pass
-        # A reboot resets the TUSB3200 but not the converters, and after reboots the DAC has been found
-        # stuck (distorted, or everything in one ear) until a power cycle (2026-10-16).
-        print("done: unplug the Mbox and plug it back in before listening (a reboot can leave the DAC stuck)")
+        # A reboot resets the TUSB3200 but not the converters. Up to v0.26 that left the DAC's right channel
+        # silent after every reboot (2026-10-18; distorted at times too) until a power cycle; from v0.27 the
+        # firmware resets the DAC itself once its clocks run (firmware/src/audio.c).
+        if version >= 27:
+            print("done")
+        else:
+            print("done: unplug the Mbox and plug it back in before listening (a reboot leaves the DAC stuck "
+                  "before v0.27)")
     return True
 
 

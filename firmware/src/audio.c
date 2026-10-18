@@ -50,13 +50,44 @@
 #include "tusb3200.h"
 #include "descriptors.h"
 
-/* GPIO port 1 on the Mbox 2 Mini, found by listening tests on 2026-10-16 (all outputs are active low):
- *   P1.1 + P1.3  both low = analog outputs on (either one alone stays silent)
+/* GPIO port 1 on the Mbox 2 Mini (all active low; listening tests on 2026-10-16, recordings on 2026-10-18):
+ *   P1.1 + P1.3  both low = analog outputs on (either one alone stays silent). P1.3 high also silences
+ *         both inputs (the ADC sends exact zeros, even out of reset), with a large swing on the inputs
+ *         when it comes back: it looks like the converters' analog supply. P1.1 leaves the inputs alone.
  *   P1.0/P1.4/P1.5  low = front "USB" light (one of the three; the other two not yet identified)
  *   P1.2  low resets the whole TUSB3200: never drive it low
- *   P1.6/P1.7  inputs: they follow the converters' clock state
+ *   P1.6  the ADC's (CS5361) reset: low, both inputs send exact zeros, and settle afresh once it's high
+ *   P1.7  the DAC's (CS4392) reset: low, both channels of the headphone output stop
+ *   P1.6 and P1.7 read high through the TUSB3200's own pull-up whenever the firmware doesn't drive them.
  * P3.0/P3.1 are the UART (MIDI on the full Mbox 2); P3.3-P3.5 showed no effect. */
 #define P1_RUNNING 0xC4                     /* P1.0, P1.1, P1.3, P1.4, P1.5 low */
+#define P1_ADC_RESET 0x40                   /* P1.6 */
+#define P1_DAC_RESET 0x80                   /* P1.7 */
+#define P1_OUTPUTS_OFF 0x02                 /* P1.1 */
+
+/* Converter resets. Both datasheets want the reset held until the supplies, MCLK and LRCK are stable;
+ * the CS4392 then starts 10 ms after its reset goes high. Up to v0.26 the firmware never drove P1.6/P1.7,
+ * so the converters left reset with the board's power, before the TUSB3200 had loaded its firmware and
+ * started any clock, and a TUSB3200 reboot (string 0x4F) stopped and restarted their clocks under them.
+ * Measured 2026-10-18 (lab/stuck/, a 440/660 Hz tone recorded through an earcup on a mic at input 1):
+ *   - v0.26: after each of 27 reboots in a row, the DAC's right channel stayed silent (by ear on
+ *     2026-10-16: "everything in the left ear"), and a 50 ms low pulse on P1.7 brought it back every time.
+ *     Switching the analog supply off and on (P1 = FFh for 2 s) didn't do it (10 tries);
+ *   - the ADC must not be reset near the analog supply's start: a reset from 1 s before to 4 s after
+ *     P1.3 goes low (held 20-100 ms, with the clocks running) left input 2 pinned at +29110, then
+ *     -29111, for about 8 s before it settled. Run through the supply's start without a reset (v0.26),
+ *     the inputs swing much less and settle in about 3 s; a reset 8 s after it moved input 2 by up to
+ *     about 1000, 15 s after by 300, minutes after by under 40.
+ * So the boot resets the DAC only: P1.7 is held from before the clocks start until they have run for
+ * DAC_SETTLE_MS, with the analog supply on and the outputs off, and the ADC runs through all of it as in
+ * v0.26. VREQ_CONVRESET (main.c) resets either converter at run time, counting SOFs instead of waiting.
+ * The other stuck states seen so far (distorted playback, the ADC sending one word, 71B6h, after short
+ * replugs) weren't reproduced; whether a run-time reset clears them is still to be seen. */
+#define DAC_SETTLE_MS 100                   /* boot: supplies and clocks settle with the DAC's reset held */
+#define CONV_HOLD_SOFS 20                   /* run time: the clocks are already stable */
+#define CONV_START_MS 20                    /* the CS4392 starts 10 ms after its reset; outputs on after this */
+static __data uint8_t conv_step;            /* run-time reset: 2 = resets held, 1 = starting, 0 = done */
+static __data uint8_t conv_sofs;            /* SOFs left in this step */
 
 #define FRAME_BYTES 6                       /* playback: 2 channels x 3 bytes */
 #define CAPTURE_BYTES 2                     /* capture: 2 bytes per channel (see above) */
@@ -166,6 +197,58 @@ static void lock_reset(void)
     lock_u = 0;
 }
 
+/* Before USB runs there are no SOFs to count: timer 0 counts machine cycles, 2 MHz with the MCU at
+ * 24 MHz (diag_init starts it; diag_sof restarts it at each SOF, which can't happen before USB connects). */
+static uint16_t timer0(void)
+{
+    uint8_t h, l;
+    do {
+        h = TH0;
+        l = TL0;
+    } while (h != TH0);
+    return ((uint16_t)h << 8) | l;
+}
+
+/* Each pass takes at least a machine cycle (0.5 us), so the guard never ends a wait early; it only keeps
+ * a stopped timer from hanging the boot (2000 passes are a few ms then). */
+static void boot_wait_ms(uint8_t ms)
+{
+    uint16_t start, guard;
+    while (ms--) {
+        start = timer0();
+        for (guard = 0; guard < 2000 && (uint16_t)(timer0() - start) < 2000; guard++)
+            ;
+    }
+}
+
+/* Run time: reset the DAC (CONV_DAC) and/or the ADC (CONV_ADC) with the clocks running (VREQ_CONVRESET),
+ * outputs off meanwhile. audio_sof finishes it. */
+void audio_reset_converters(uint8_t which)
+{
+    uint8_t p1 = P1_RUNNING | P1_OUTPUTS_OFF;
+    if (which & CONV_DAC)
+        p1 &= ~P1_DAC_RESET;
+    if (which & CONV_ADC)
+        p1 &= ~P1_ADC_RESET;
+    P1 = p1;
+    conv_step = 2;
+    conv_sofs = CONV_HOLD_SOFS;
+}
+
+static void conv_reset_sof(void)
+{
+    if (!conv_sofs || --conv_sofs)
+        return;
+    if (conv_step == 2) {
+        P1 = P1_RUNNING | P1_OUTPUTS_OFF;           /* out of reset, outputs still off */
+        conv_step = 1;
+        conv_sofs = CONV_START_MS;
+    } else {
+        P1 = P1_RUNNING;
+        conv_step = 0;
+    }
+}
+
 /* Called for every USB start-of-frame. */
 void audio_sof(void)
 {
@@ -176,6 +259,7 @@ void audio_sof(void)
     int16_t err;
     int32_t u;
 
+    conv_reset_sof();
     if (!lock_enabled)
         return;
     if (lock_skip) {
@@ -380,12 +464,18 @@ void audio_init(void)
         raw_cfg = 1;
     }
 #endif
+    conv_step = 0;
+    conv_sofs = 0;
+    P1 = (P1_RUNNING | P1_OUTPUTS_OFF) & ~P1_DAC_RESET;    /* DAC in reset, analog supply on, outputs off */
     lock_reset();
     lock_enabled = 1;
     master_clock_init();
     codec_port_configure();
     capture_start();
-    P1 = P1_RUNNING;                                /* clocks are running: outputs on, USB light on */
+    boot_wait_ms(DAC_SETTLE_MS);
+    P1 = P1_RUNNING | P1_OUTPUTS_OFF;               /* clocks are stable: DAC out of reset */
+    boot_wait_ms(CONV_START_MS);
+    P1 = P1_RUNNING;                                /* outputs on, USB light on */
 }
 
 void audio_set_clock_master(uint8_t master)

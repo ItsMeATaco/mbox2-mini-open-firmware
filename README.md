@@ -168,8 +168,9 @@ window:
 - **A new hub:** click it and the hub downloads the new version, swaps it in and restarts itself. If the
   release brings a newer ASIO driver, the DAW (ASIO) card then shows **Update**.
 - **New firmware:** it's ready on the Firmware card (cog > Firmware). Click **Install**: it goes in over USB
-  in about 30 seconds, with no Pi and no wires. **Unplug and replug the Mbox afterwards**: a restart of the
-  Mbox's chip can leave its converter sounding distorted until it loses power once.
+  in about 30 seconds, with no Pi and no wires. From firmware v0.27 on, the Mbox restarts into it ready to
+  play. Installing anything older, **unplug and replug the Mbox afterwards**: before v0.27 a restart of the
+  Mbox's chip left its converter with one channel silent or distorted until it lost power once.
 
 The firmware update is written so that an interruption can't leave a half-written firmware that starts: the
 chip only becomes bootable again after the whole image is written and checked.

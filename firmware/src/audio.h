@@ -32,6 +32,9 @@ void audio_set_codec_mode(uint8_t mode, uint8_t creset);   /* nonzero: I2S mode 
 void audio_set_mclk_ratio(uint8_t ratio);                   /* 0: 256 fs, 1: 384 fs, 2: 512 fs */
 void audio_set_raw(const __data uint8_t *cfg);              /* bring-up: CPTCNF1-4, CPTCTL, DMA slots, ratio */
 void audio_sof(void);                                      /* call on every USB start-of-frame */
+#define CONV_DAC 0x01
+#define CONV_ADC 0x02
+void audio_reset_converters(uint8_t which);                 /* CONV_* bits: reset again (about 40 ms, over SOFs) */
 void audio_set_lock(uint8_t enabled);                       /* bring-up: 0 freezes the clock trim */
 int16_t audio_lock_u(void);                                 /* current N trim, LSB */
 int16_t audio_lock_phase(void);                             /* accumulated MCLK error, cycles */

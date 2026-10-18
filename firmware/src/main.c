@@ -63,6 +63,9 @@
 #define VREQ_LOCK     0x0A  /* no data: wValue 1 = clock lock running, 0 = trim frozen */
 #define VREQ_DMAMODE  0x0B  /* no data: wValue bit 0 = playback, bit 1 = capture DMA in wrap-around mode (audio.c);
                              * wIndex ring sizes in 8-byte units, playback low byte, capture high byte (0 = default) */
+#define VREQ_CONVRESET 0x0C /* no data: wValue bit 0 resets the DAC, bit 1 the ADC (0: both; audio.c), outputs
+                             * off meanwhile; sound returns about 40 ms later. Not the ADC in the first 15 s after
+                             * power-up: input 2 can stay pinned for seconds (audio.c) */
 /* Also answered whatever the recipient: MS_VENDOR_CODE, the Microsoft OS descriptors (descriptors.c). */
 
 enum { EP0_IDLE, EP0_IN_DATA, EP0_OUT_DATA, EP0_STATUS_IN };
@@ -397,6 +400,10 @@ static uint8_t vendor_request(void)
         return 1;
     case VREQ_DMAMODE:
         audio_set_dma_mode(setup[2], setup[4], setup[5]);
+        ep0_status_in();
+        return 1;
+    case VREQ_CONVRESET:
+        audio_reset_converters(setup[2] & (CONV_DAC | CONV_ADC) ? setup[2] : CONV_DAC | CONV_ADC);
         ep0_status_in();
         return 1;
     case VREQ_CPTRAW:
