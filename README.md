@@ -1,5 +1,9 @@
 # Mbox 2 Mini open firmware
 
+<a href="https://buymeacoffee.com/itsmeataco"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" height="40"></a>
+
+If this brought your Mbox back to life, you can [buy me a coffee](https://buymeacoffee.com/itsmeataco).
+
 New firmware for the Digidesign / Avid **Mbox 2 Mini** that turns it into a standard USB audio device, so it
 runs on Windows 11's own built-in driver. No Avid driver, no blue screens, and Secure Boot and Memory
 Integrity stay on. It comes with:
