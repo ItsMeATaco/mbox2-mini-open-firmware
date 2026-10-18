@@ -196,13 +196,13 @@ ASIOError Driver::setSampleRate(ASIOSampleRate rate) {
              rate_, b.min, b.min + b.granularity, b.min + 2 * b.granularity);
     error_ = text;
     Log("setSampleRate: %s; asking the host for a reset", text);
-    if (HostSupports(kAsioResetRequest)) callbacks_->asioMessage(kAsioResetRequest, 0, nullptr, nullptr);
+    Tell(kAsioResetRequest);
     return ASE_OK;
   }
   if (!engine_.Open(frames_, rate_, this, &error_)) return ASE_HWMalfunction;
   error_.clear();
   if (was_started) start();
-  LatenciesChanged();
+  Tell(kAsioLatenciesChanged);
   return ASE_OK;
 }
 
@@ -380,14 +380,24 @@ void Driver::Process(const int16_t* input, uint8_t* output, int frames, int64_t 
   half_ = 1 - half;
 }
 
-void Driver::LatenciesChanged() {
-  if (HostSupports(kAsioLatenciesChanged)) callbacks_->asioMessage(kAsioLatenciesChanged, 0, nullptr, nullptr);
+void Driver::Tell(long selector) {
+  if (HostSupports(selector)) callbacks_->asioMessage(selector, 0, nullptr, nullptr);
+}
+
+// The engine keeps the latency it reported through glitches; this is for when it can't. Hosts differ on
+// kAsioLatenciesChanged (Live 12 ignores it, JUCE hosts have only acknowledged it), so the driver also asks for a
+// reset, as interface drivers do when their latency changes: the host reopens the driver and reads the latencies again.
+void Driver::LatencyMustChange() {
+  Log("latency changed: in %d, out %d frames; asking the host for a reset", engine_.input_latency(frames_, rate_),
+      engine_.output_latency(frames_, rate_));
+  Tell(kAsioLatenciesChanged);
+  Tell(kAsioResetRequest);
 }
 
 void Driver::DeviceLost() {
   error_ = "The Mbox was disconnected or taken over. Reset the driver in your DAW's audio settings.";
   Log("device lost; asking the host for a reset");
-  if (HostSupports(kAsioResetRequest)) callbacks_->asioMessage(kAsioResetRequest, 0, nullptr, nullptr);
+  Tell(kAsioResetRequest);
 }
 
 }  // namespace mbox2::asio

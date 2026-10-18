@@ -10,6 +10,14 @@
 // which opens both endpoints and streams silence until Start(); Stop() goes back to silence and Close()
 // releases the device. So the streams keep one phase from Open() to Close(), and the latencies measured
 // in Open() stay true across Start()/Stop().
+//
+// The input latency is fixed for the session, like a hardware interface's safety buffer: the FIFO keeps one
+// period plus 1 ms more input than the streams' phase needs, and the DAW is told so. Each input block is
+// read at exactly that age, by the capture packets' timestamps. After a glitch (a late period, a late,
+// missing or extra capture packet, or the streams settling on another phase) the engine moves its read
+// position back to that age, so DAWs that read the latency only when they open the device (Ableton Live)
+// keep recordings aligned. Only if the input can't be read at the reported age any more does it ask the
+// DAW to reopen the device.
 #pragma once
 
 #include <windows.h>
@@ -64,8 +72,9 @@ class Engine {
     // as many interleaved stereo 24-bit (3-byte) frames. `position` counts frames since Start(); `time_ns`
     // is the start of the period in QueryPerformanceCounter time, in nanoseconds.
     virtual void Process(const int16_t* input, uint8_t* output, int frames, int64_t position, int64_t time_ns) = 0;
-    // The engine had to buffer more input after an underrun, so the input latency grew.
-    virtual void LatenciesChanged() = 0;
+    // The input can't be read at the latency reported any more (the streams moved further than the safety
+    // margin after a glitch): the engine reports the new latency, and the host has to reopen the device.
+    virtual void LatencyMustChange() = 0;
     // The device stopped (unplugged, or taken over); the engine streams nothing more until Close().
     virtual void DeviceLost() = 0;
 
@@ -76,14 +85,15 @@ class Engine {
   struct Stats {
     uint64_t periods = 0;          // render periods since Open()
     uint64_t callbacks = 0;        // Process() calls since Start()
-    uint64_t input_underruns = 0;  // periods that had no full input block while running
+    uint64_t input_underruns = 0;  // periods that had no full input block while running (silence instead)
     uint64_t input_waits = 0;      // periods whose capture packet came just after the render event (waited for)
     uint64_t input_dropped = 0;    // input blocks dropped to keep the reported latency (after a missed period)
+    uint64_t input_realigns = 0;   // read-position moves back to the reported latency, under a block (after glitches)
     uint64_t capture_gaps = 0;     // capture packets missing (device-position jumps or discontinuity flags)
     uint64_t late_periods = 0;     // render events more than half a period late while running
-    uint64_t latency_changes = 0;  // times the latencies were re-measured and the DAW told (after glitches)
+    uint64_t latency_changes = 0;  // times the reported latency couldn't be kept and the DAW was asked to reset
     double max_process_us = 0;     // longest Process() call
-    int input_margin = 0;          // extra input blocks kept in the FIFO
+    int input_safety = 0;          // input frames kept beyond what the streams' phase needs (the safety margin)
     int input_age_frames = 0;      // measured age of an input block's first frame at Process() (Windows side)
     int output_queue_frames = 0;   // measured frames queued ahead of a new output block (Windows side)
     uint64_t arrivals[4] = {};     // render periods with 0, 1, 2 and 3+ capture packets since the previous one
@@ -129,8 +139,13 @@ class Engine {
   HRESULT RenderPeriod(int64_t now);
   const int16_t* TakeInput(int64_t now, bool running);
   void PushInput(const int16_t* data, uint32_t frames);
+  void DropInput(size_t frames);
+  void InsertSilence(size_t frames);
+  void Reacquire();
+  void Acquired(double minimum);
+  void ChangeLatency(double minimum, const char* why);
   void MeasureOutput(int64_t now);
-  void CheckLatencies(bool running);
+  void CheckAlignment();
 
   std::wstring render_id_, capture_id_;
   bool rate_44k1_ = false;
@@ -160,8 +175,7 @@ class Engine {
   uint64_t next_capture_position_ = 0;
   bool have_capture_ = false;
   bool input_primed_ = false;
-  int margin_ = 1;
-  bool margin_fixed_ = false;
+  int safety_blocks_ = 1;              // HKCU\Software\Mbox2Asio InputMargin: 0 for the lowest latency, no margin
   uint64_t last_packet_position_ = 0;  // device position, length and QPC time (100 ns) of the newest packet
   uint32_t last_packet_frames_ = 0;
   int64_t last_packet_qpc_ = 0;
@@ -182,6 +196,19 @@ class Engine {
   static constexpr int kLateRecords = 16;
   LatePeriod late_records_[kLateRecords] = {};
   int late_record_count_ = 0;
+  // What the input side did about glitches, also logged by Close() (the log file is too slow for the audio thread).
+  struct InputEvent {
+    int64_t qpc;
+    const char* what;  // "dropped" (stale blocks), "silence" (underrun), "capture gap", "moved"
+    int frames;        // dropped or moved frames; for "moved", positive = read fresher
+  };
+  static constexpr int kInputEvents = 32;
+  InputEvent input_events_[kInputEvents] = {};
+  int input_event_count_ = 0;
+  void Note(int64_t qpc, const char* what, int frames) {
+    if (input_event_count_ < kInputEvents) input_events_[input_event_count_++] = {qpc, what, frames};
+  }
+  void Glitch();
   int64_t last_capture_wake_ = 0;
   int capture_wakes_since_render_ = 0;
   int64_t qpc_to_filetime_ = 0;
@@ -190,25 +217,42 @@ class Engine {
   int64_t last_render_ = 0;
   int64_t position_ = 0;
   double input_age_ = -1, output_queue_ = -1;  // running means, frames
-  // The input age the DAW was told (frames): set at the end of the warm-up, and again when the measured age
-  // moves away from it for good (after a glitch the streams can settle on another phase).
+  double last_age_ = 0;                        // age of the latest input block delivered, frames
+  bool delivered_ = false;                     // this period delivered a block at the reported age
+  bool notify_change_ = false;                 // the reported latency changed: tell the client after Process()
+  // The input age the DAW was told (frames): the minimum the streams' phase allows, measured while acquiring,
+  // plus the safety margin. Set once per Open(); it changes only when the input can't be read at it any more.
   double target_age_ = -1;
-  int drift_periods_ = 0;
+  // Acquiring (after Open(), and after the capture stream restarts): the FIFO delivers its newest full block,
+  // the minimum age, and measures it over the second half of `acquire_periods_`; then it moves to the target.
+  bool locked_ = false;
+  int acquire_periods_ = 0, acquired_periods_ = 0;
+  double acquire_age_sum_ = 0;
+  int acquire_age_count_ = 0;
+  // After a glitch the engine compares the delivered blocks' age with the target over windows of kWindow
+  // periods without a glitch, and moves the read position by the mean difference if it is off by more than
+  // kOffFrames; after such a move it checks once more and corrects to the frame (1.5 frames or more off). At
+  // most kMaxMoves moves per glitch, so it can't hunt.
   static constexpr int kWatchSeconds = 2;
-  uint64_t watch_until_ = 0;     // look for a new phase until this period (set after a glitch)
-  int pending_skips_ = 0;        // render periods missed whose capture blocks are still to drop
-  uint64_t skip_deadline_ = 0;
+  static constexpr int kWindow = 32;
+  static constexpr double kOffFrames = 24;
+  static constexpr int kMaxMoves = 4;
+  uint64_t watch_until_ = 0;  // compare until this period (set after a glitch)
+  int window_periods_ = 0;
+  double window_sum_ = 0;
+  size_t window_min_left_ = 0;  // fewest frames left in the FIFO after a block was taken, over the window
+  bool settle_ = false;
+  int moves_ = 0;
   int measured_periods_ = 0;
   int warmup_ = 0;  // periods streamed before Open() returns
-  double warmup_age_sum_ = 0;
-  int warmup_age_count_ = 0;
 
   // Stats, written by the engine thread.
-  std::atomic<uint64_t> periods_{0}, callbacks_{0}, underruns_{0}, input_waits_{0}, dropped_{0}, gaps_{0}, late_{0};
+  std::atomic<uint64_t> periods_{0}, callbacks_{0}, underruns_{0}, input_waits_{0}, dropped_{0}, realigns_{0}, gaps_{0},
+      late_{0};
   std::atomic<uint64_t> arrivals_[4] = {};
   std::atomic<double> max_process_us_{0}, slack_min_us_{1e9}, slack_max_us_{-1e9}, slack_sum_us_{0};
   std::atomic<uint64_t> slack_count_{0};
-  std::atomic<int> input_age_frames_{0}, output_queue_frames_{0}, margin_now_{1};
+  std::atomic<int> input_age_frames_{0}, output_queue_frames_{0}, safety_frames_{0};
   std::atomic<int> reported_age_{0};
   std::atomic<uint64_t> latency_changes_{0};
 };

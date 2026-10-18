@@ -37,9 +37,13 @@ small memory chip on the board at power-up. Replace that firmware and the driver
 **ASIO driver**
 - Lets DAWs that want ASIO (Ableton Live, Cubase, FL Studio, Reaper and others) use the Mbox directly.
 - Runs entirely in user mode on top of Windows' own driver: no kernel code and no test signing.
-- 9.8 ms measured round trip at a 144 sample buffer (48 kHz).
-- Reports its latency to within 1 sample of the measured round trip, so recordings line up without manual
-  offset tweaking.
+- 13.5 ms measured round trip at a 144 sample buffer (48 kHz). That includes a fixed input safety margin
+  of one buffer plus 1 ms, like a hardware interface's safety buffer. `InputMargin` = 0 (DWORD under
+  `HKCU\Software\Mbox2Asio`) drops it for the lowest latency (9.8 ms), with less protection against glitches.
+- Reports its latency to within a few samples of the measured round trip, so recordings line up without
+  manual offset tweaking.
+- Keeps that latency fixed for the whole session, also through glitches, so overdubs stay aligned in DAWs
+  that only read it when they open the device, such as Ableton Live.
 
 **Mbox Hub**
 - Live input and output meters with peak hold and clip lights.

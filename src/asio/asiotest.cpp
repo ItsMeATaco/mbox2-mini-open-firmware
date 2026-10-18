@@ -339,8 +339,8 @@ int Run(double seconds, long frames, const std::wstring& record_path) {
     if (elapsed >= next_report) {
       Engine::Stats s;
       g_driver->future(mbox2::asio::kFutureGetStats, &s);
-      printf("%4.0f s: %lld callbacks, %lld late; driver: %llu underruns, %llu late, %llu gaps, %llu dropped\n", elapsed,
-             g_callbacks, g_late, s.input_underruns, s.late_periods, s.capture_gaps, s.input_dropped);
+      printf("%4.0f s: %lld callbacks, %lld late; driver: %llu underruns, %llu late, %llu gaps, %llu dropped, %llu realigned\n",
+             elapsed, g_callbacks, g_late, s.input_underruns, s.late_periods, s.capture_gaps, s.input_dropped, s.input_realigns);
       next_report += 10;
     }
     if (g_position >= total) break;
@@ -354,13 +354,13 @@ int Run(double seconds, long frames, const std::wstring& record_path) {
 
   printf("ran %.1f s: %lld callbacks (%.1f expected), %lld late (>1.5 periods), longest gap %.2f ms\n", elapsed,
          g_callbacks, elapsed * g_rate / g_frames, g_late, g_max_interval_ms);
-  printf("driver: %llu periods, %llu input underruns, %llu input waits, %llu dropped, %llu capture gaps, %llu late, "
-         "%llu latency changes, max process %.0f us\n",
-         s.periods, s.input_underruns, s.input_waits, s.input_dropped, s.capture_gaps, s.late_periods, s.latency_changes,
-         s.max_process_us);
-  printf("driver: input margin %d, input age %d, output queue %d frames; capture slack %.0f/%.0f/%.0f us; "
+  printf("driver: %llu periods, %llu input underruns, %llu input waits, %llu dropped, %llu realigned, %llu capture gaps, "
+         "%llu late, %llu latency changes, max process %.0f us\n",
+         s.periods, s.input_underruns, s.input_waits, s.input_dropped, s.input_realigns, s.capture_gaps, s.late_periods,
+         s.latency_changes, s.max_process_us);
+  printf("driver: input safety %d, input age %d, output queue %d frames; capture slack %.0f/%.0f/%.0f us; "
          "packets per period 0:%llu 1:%llu 2:%llu 3+:%llu\n",
-         s.input_margin, s.input_age_frames, s.output_queue_frames, s.slack_min_us, s.slack_mean_us, s.slack_max_us,
+         s.input_safety, s.input_age_frames, s.output_queue_frames, s.slack_min_us, s.slack_mean_us, s.slack_max_us,
          s.arrivals[0], s.arrivals[1], s.arrivals[2], s.arrivals[3]);
   printf("reported latency at the end: in %ld, out %ld = %ld frames (%.2f ms)\n", in_lat, out_lat, in_lat + out_lat,
          (in_lat + out_lat) * 1000.0 / g_rate);

@@ -101,6 +101,22 @@ std::string OpenError(const char* side, HRESULT hr) {
   return text;
 }
 
+// HKCU\Software\Mbox2Asio InputMargin: the safety margin in blocks (default 1; 0 for the lowest latency).
+int SafetyBlocks() { return static_cast<int>(std::min<DWORD>(ReadSetting(L"InputMargin", 1), 2)); }
+
+// The input age reported to the DAW (frames) for streams whose newest full input block is `minimum` frames old
+// at the render event. The newest block's age is one block plus the phase between the streams' events, which is
+// anywhere from 0 to a period and can change after a glitch. With a margin the engine reads one block further
+// back than any phase needs, plus 1 ms: in every phase the streams can start or settle in, the input can still be
+// read at this age, and a capture packet can come at least 1 ms late before a block is missing. Measured on
+// this PC (2026-10-17): capture packets came up to 1.3 ms late against the USB clock, but the render event was
+// then late by about as much (one interrupt serves both), so the newest packet was always in by the render
+// event. Without a margin, the age is the minimum and can only be kept while the phase doesn't get older.
+double TargetAge(double minimum, int frames, int rate, int blocks) {
+  if (blocks <= 0) return minimum;
+  return std::max(static_cast<double>((1 + blocks) * frames), minimum) + rate / 1000.0;
+}
+
 }  // namespace
 
 struct Engine::Wasapi {
@@ -182,33 +198,35 @@ bool Engine::Open(int frames, int rate, Client* client, std::string* error) {
   fifo_read_ = fifo_count_ = 0;
   fifo_first_position_ = next_capture_position_ = 0;
   have_capture_ = input_primed_ = false;
-  const DWORD margin = ReadSetting(L"InputMargin", 0xFFFFFFFF);
-  margin_fixed_ = margin <= 2;
-  margin_ = margin_fixed_ ? static_cast<int>(margin) : 0;
+  safety_blocks_ = SafetyBlocks();
   last_packet_position_ = 0;
   last_packet_qpc_ = last_packet_arrival_ = 0;
   packets_since_render_ = 0;
   written_ = 0;
   last_render_ = position_ = 0;
   input_age_ = output_queue_ = target_age_ = -1;
-  drift_periods_ = 0;
-  watch_until_ = skip_deadline_ = 0;
-  pending_skips_ = 0;
+  last_age_ = 0;
+  delivered_ = notify_change_ = false;
+  locked_ = false;
+  acquire_periods_ = acquired_periods_ = acquire_age_count_ = 0;
+  acquire_age_sum_ = 0;
+  watch_until_ = 0;
+  window_periods_ = moves_ = 0;
+  window_sum_ = 0;
+  window_min_left_ = 0;
+  settle_ = false;
   reported_age_ = 0;
   latency_changes_ = 0;
   measured_periods_ = 0;
   warmup_ = 0;
-  warmup_age_sum_ = 0;
-  warmup_age_count_ = 0;
-  periods_ = callbacks_ = underruns_ = input_waits_ = dropped_ = gaps_ = late_ = slack_count_ = 0;
+  periods_ = callbacks_ = underruns_ = input_waits_ = dropped_ = realigns_ = gaps_ = late_ = slack_count_ = 0;
   for (auto& a : arrivals_) a = 0;
   max_process_us_ = 0;
   slack_min_us_ = 1e9;
   slack_max_us_ = -1e9;
   slack_sum_us_ = 0;
-  input_age_frames_ = output_queue_frames_ = 0;
-  margin_now_ = margin_;
-  late_record_count_ = 0;
+  input_age_frames_ = output_queue_frames_ = safety_frames_ = 0;
+  late_record_count_ = input_event_count_ = 0;
   last_capture_wake_ = 0;
   capture_wakes_since_render_ = 0;
   FILETIME wall;
@@ -236,10 +254,10 @@ bool Engine::Open(int frames, int rate, Client* client, std::string* error) {
     return false;
   }
   const Stats s = stats();
-  Log("open %d frames at %d Hz: input age %d, output queue %d, margin %d, slack %.0f..%.0f us, arrivals 0:%llu 1:%llu 2:%llu "
-      "3+:%llu",
-      frames, rate, s.input_age_frames, s.output_queue_frames, s.input_margin, s.slack_min_us, s.slack_max_us,
-      s.arrivals[0], s.arrivals[1], s.arrivals[2], s.arrivals[3]);
+  Log("open %d frames at %d Hz: input age %d (newest block %d + safety %d), output queue %d, slack %.0f..%.0f us, "
+      "arrivals 0:%llu 1:%llu 2:%llu 3+:%llu",
+      frames, rate, reported_age_.load(), reported_age_.load() - s.input_safety, s.input_safety, s.output_queue_frames,
+      s.slack_min_us, s.slack_max_us, s.arrivals[0], s.arrivals[1], s.arrivals[2], s.arrivals[3]);
   return true;
 }
 
@@ -267,12 +285,12 @@ void Engine::Close() {
     thread_.join();
   }
   const Stats s = stats();
-  Log("close: %llu periods, %llu input underruns, %llu waits, %llu dropped, %llu capture gaps, %llu late, %llu latency changes, "
-      "max process %.0f us, "
-      "margin %d, input age %d, output queue %d, slack %.0f/%.0f/%.0f us, arrivals 0:%llu 1:%llu 2:%llu 3+:%llu",
-      s.periods, s.input_underruns, s.input_waits, s.input_dropped, s.capture_gaps, s.late_periods, s.latency_changes,
-      s.max_process_us, s.input_margin, s.input_age_frames, s.output_queue_frames, s.slack_min_us, s.slack_mean_us, s.slack_max_us,
-      s.arrivals[0], s.arrivals[1], s.arrivals[2], s.arrivals[3]);
+  Log("close: %llu periods, %llu input underruns, %llu waits, %llu dropped, %llu realigned, %llu capture gaps, %llu late, "
+      "%llu latency changes, max process %.0f us, safety %d, input age %d, output queue %d, slack %.0f/%.0f/%.0f us, "
+      "arrivals 0:%llu 1:%llu 2:%llu 3+:%llu",
+      s.periods, s.input_underruns, s.input_waits, s.input_dropped, s.input_realigns, s.capture_gaps, s.late_periods,
+      s.latency_changes, s.max_process_us, s.input_safety, s.input_age_frames, s.output_queue_frames, s.slack_min_us,
+      s.slack_mean_us, s.slack_max_us, s.arrivals[0], s.arrivals[1], s.arrivals[2], s.arrivals[3]);
   for (int i = 0; i < late_record_count_; ++i) {
     const LatePeriod& r = late_records_[i];
     const int64_t ticks = r.qpc + qpc_to_filetime_;
@@ -285,12 +303,24 @@ void Engine::Close() {
         local.wHour, local.wMinute, local.wSecond, local.wMilliseconds, r.running ? "" : " (not running)", r.gap_ms,
         r.capture_wakes, r.packets, r.capture_wake_ms, r.packet_age_ms);
   }
+  for (int i = 0; i < input_event_count_; ++i) {
+    const InputEvent& e = input_events_[i];
+    const int64_t ticks = e.qpc + qpc_to_filetime_;
+    FILETIME utc{static_cast<DWORD>(ticks), static_cast<DWORD>(static_cast<uint64_t>(ticks) >> 32)};
+    SYSTEMTIME st{}, local{};
+    FileTimeToSystemTime(&utc, &st);
+    SystemTimeToTzSpecificLocalTime(nullptr, &st, &local);
+    Log("input at %02d:%02d:%02d.%03d: %s %+d frames", local.wHour, local.wMinute, local.wSecond, local.wMilliseconds, e.what,
+        e.frames);
+  }
 }
 
 int Engine::input_latency(int frames, int rate) const {
   if (is_open() && frames == frames_ && rate == rate_ && reported_age_ > 0) return reported_age_ + ExtraInputFrames(rate);
-  // Not measured yet: one block, plus up to one more for the phase between the streams.
-  return frames + frames / 2 + ExtraInputFrames(rate);
+  // Not measured yet: one block, plus up to one more for the phase between the streams, plus the margin. With the
+  // margin the result is exact: the measurement only matters when a glitch moves the phase.
+  return static_cast<int>(std::lround(TargetAge(frames + frames / 2.0, frames, rate, SafetyBlocks()))) +
+         ExtraInputFrames(rate);
 }
 
 int Engine::output_latency(int frames, int rate) const {
@@ -309,7 +339,8 @@ Engine::Stats Engine::stats() const {
   s.capture_gaps = gaps_;
   s.late_periods = late_;
   s.max_process_us = max_process_us_;
-  s.input_margin = margin_now_;
+  s.input_realigns = realigns_;
+  s.input_safety = safety_frames_;
   s.latency_changes = latency_changes_;
   s.input_age_frames = input_age_frames_;
   s.output_queue_frames = output_queue_frames_;
@@ -401,8 +432,10 @@ void Engine::Run() {
 
   setup_ok_ = Setup(&setup_error_);
   if (setup_ok_) {
-    // Stream silence for at least 150 ms before Open() returns: settles the input FIFO and measures latencies.
+    // Stream silence for at least 150 ms before Open() returns: settles the input FIFO, measures the phase between
+    // the streams and moves the input to the age reported.
     warmup_ = std::max(16, static_cast<int>(std::ceil(0.15 * rate_ / frames_)));
+    acquire_periods_ = warmup_;
     bool ready = false;
     int quiet_ms = 0;
     HANDLE waits[] = {stop_event_, w_->render_event, w_->capture_event};
@@ -439,11 +472,8 @@ void Engine::Run() {
         }
         break;
       }
-      if (!ready && measured_periods_ >= warmup_) {
+      if (!ready && locked_) {
         ready = true;
-        // The mean over the second half of the warm-up; the first periods still carry the streams' start.
-        target_age_ = warmup_age_count_ ? warmup_age_sum_ / warmup_age_count_ : input_age_;
-        reported_age_ = static_cast<int>(std::lround(target_age_));
         SetEvent(ready_event_);
       }
     }
@@ -473,6 +503,33 @@ void Engine::PushInput(const int16_t* data, uint32_t frames) {
   }
 }
 
+void Engine::DropInput(size_t frames) {
+  frames = std::min(frames, fifo_count_);
+  fifo_read_ = (fifo_read_ + frames) % fifo_capacity_;
+  fifo_count_ -= frames;
+  fifo_first_position_ += frames;
+}
+
+// Puts silence in front of the oldest frame: the read position moves back in time.
+void Engine::InsertSilence(size_t frames) {
+  frames = std::min(frames, fifo_capacity_ - fifo_count_);
+  fifo_read_ = (fifo_read_ + fifo_capacity_ - frames) % fifo_capacity_;
+  for (size_t i = 0; i < frames; ++i) {
+    memset(&fifo_[(fifo_read_ + i) % fifo_capacity_ * kChannels], 0, kChannels * sizeof(int16_t));
+  }
+  fifo_count_ += frames;
+  fifo_first_position_ -= frames;
+}
+
+// The capture stream restarted (or jumped back): measure the phase again, delivering silence meanwhile.
+void Engine::Reacquire() {
+  fifo_count_ = 0;
+  input_primed_ = locked_ = false;
+  acquired_periods_ = acquire_age_count_ = 0;
+  acquire_age_sum_ = 0;
+  if (target_age_ >= 0) acquire_periods_ = 16;
+}
+
 HRESULT Engine::DrainCapture(int64_t now) {
   for (;;) {
     UINT32 packet = 0;
@@ -488,19 +545,24 @@ HRESULT Engine::DrainCapture(int64_t now) {
     if (hr == AUDCLNT_S_BUFFER_EMPTY) return S_OK;
 
     if (have_capture_ && position != next_capture_position_) {
-      // Lost or repeated frames: fill a short gap with silence so later blocks keep their timing; restart
-      // the FIFO after anything odder.
+      // Lost frames: fill a short gap with silence so later blocks keep their timing; start over after anything
+      // odder.
       gaps_ = gaps_ + 1;
-      watch_until_ = periods_ + kWatchSeconds * rate_ / frames_;
+      Glitch();
       const int64_t gap = static_cast<int64_t>(position - next_capture_position_);
+      Note(now, "capture gap", static_cast<int>(gap));
       if (gap > 0 && gap < static_cast<int64_t>(fifo_capacity_)) {
-        if (fifo_count_) PushInput(nullptr, static_cast<uint32_t>(gap));
+        PushInput(nullptr, static_cast<uint32_t>(gap));
       } else {
-        fifo_count_ = 0;
-        input_primed_ = false;
+        Reacquire();
       }
     } else if (have_capture_ && (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY)) {
+      // Seen on this PC (2026-10-17, about once a minute in some runs): a packet flagged so and the next one
+      // together, without a jump in the device position. The positions then run a packet ahead of the
+      // timestamps, which TakeInput() sees as a stale block.
       gaps_ = gaps_ + 1;
+      Glitch();
+      Note(now, "capture gap", 0);
     }
     if (fifo_count_ == 0) fifo_first_position_ = position;
     PushInput(flags & AUDCLNT_BUFFERFLAGS_SILENT ? nullptr : reinterpret_cast<const int16_t*>(data), frames);
@@ -518,10 +580,10 @@ HRESULT Engine::DrainCapture(int64_t now) {
 
 const int16_t* Engine::TakeInput(int64_t now, bool running) {
   const size_t block = static_cast<size_t>(frames_);
-  auto drop = [&](size_t n) {
-    fifo_read_ = (fifo_read_ + n) % fifo_capacity_;
-    fifo_count_ -= n;
-    fifo_first_position_ += n;
+  delivered_ = false;
+  auto silence = [&] {
+    std::fill(block_.begin(), block_.end(), int16_t{0});
+    return block_.data();
   };
   // Age of the oldest frame in the FIFO. usbaudio.sys stamps a capture packet when it completes, not when
   // its first frame came in (measured: the round trip is a whole packet longer than the stamp says).
@@ -530,77 +592,155 @@ const int16_t* Engine::TakeInput(int64_t now, bool running) {
     return static_cast<double>(now - last_packet_qpc_) * rate_ / kTicksPerSecond +
            static_cast<double>(newest_end - static_cast<int64_t>(fifo_first_position_));
   };
-  if (input_primed_ && fifo_count_ > (margin_ + 2) * block) {
-    drop(fifo_count_ - (margin_ + 1) * block);
-    if (running) dropped_ = dropped_ + 1;
-  }
-  // When the render side misses periods (its event came late), their capture packets stay in the FIFO and
-  // every later block would be that much older than the latency the DAW was told. Drop them, but only down
-  // to the FIFO's steady-state depth, so packets that merely came early (jitter) are kept.
-  while (pending_skips_ > 0 && input_primed_ && fifo_count_ >= (margin_ + 2) * block) {
-    drop(block);
-    --pending_skips_;
-    if (running) dropped_ = dropped_ + 1;
-  }
-  if (pending_skips_ > 0 && periods_ >= skip_deadline_) pending_skips_ = 0;
-  if (!input_primed_) {
-    if (fifo_count_ < (margin_ + 1) * block) {
-      std::fill(block_.begin(), block_.end(), int16_t{0});
-      return block_.data();
-    }
-    drop(fifo_count_ - (margin_ + 1) * block);
-    input_primed_ = true;
-  } else if (fifo_count_ < block) {
-    // The capture packet for this period isn't in yet: keep one more block from now on.
-    if (running) underruns_ = underruns_ + 1;
-    input_primed_ = false;
-    watch_until_ = periods_ + kWatchSeconds * rate_ / frames_;
-    if (!margin_fixed_ && margin_ < 2) {
-      ++margin_;
-      margin_now_ = margin_;
-      if (target_age_ > 0) {
-        target_age_ += static_cast<double>(block);
-        reported_age_ = static_cast<int>(std::lround(target_age_));
-      }
-      Log("input underrun: keeping %d extra block(s) of input", margin_);
-      if (running && client_) client_->LatenciesChanged();
-    }
-    std::fill(block_.begin(), block_.end(), int16_t{0});
+  auto take = [&] {
+    const size_t first = std::min(block, fifo_capacity_ - fifo_read_);
+    memcpy(block_.data(), &fifo_[fifo_read_ * kChannels], first * kChannels * sizeof(int16_t));
+    if (first < block) memcpy(block_.data() + first * kChannels, fifo_.data(), (block - first) * kChannels * sizeof(int16_t));
+    DropInput(block);
     return block_.data();
+  };
+
+  if (!locked_) {
+    // Acquiring: deliver the newest full block, the least input latency the streams' phase allows, and measure
+    // its age over the second half of the acquisition (the first periods still carry the streams' start).
+    if (!input_primed_) {
+      if (fifo_count_ < block) return silence();
+      DropInput(fifo_count_ - block);
+      input_primed_ = true;
+    } else if (fifo_count_ > 2 * block) {
+      DropInput(fifo_count_ - block);
+    } else if (fifo_count_ < block) {
+      input_primed_ = false;
+      return silence();
+    }
+    const double age = oldest_age();
+    if (acquired_periods_ >= acquire_periods_ / 2) {
+      acquire_age_sum_ += age;
+      ++acquire_age_count_;
+    }
+    input_age_frames_ = static_cast<int>(std::lround(age));
+    const bool reacquiring = target_age_ >= 0;
+    const int16_t* input = take();
+    if (++acquired_periods_ >= acquire_periods_) Acquired(acquire_age_sum_ / acquire_age_count_);
+    // After a capture restart these blocks aren't at the reported latency: silence until they are.
+    return reacquiring ? silence() : input;
   }
 
-  const double age = oldest_age();
+  double age = oldest_age();
+  // Whole blocks older than the reported latency: the render side missed periods, a capture packet came after
+  // its period (that period got silence), or the capture stream delivered an extra packet. Drop them. Moves
+  // of less than a block (half a millisecond short of one, so a late wake-up can't pass for one) are left to
+  // CheckAlignment(), which averages over many periods.
+  int stale = 0;
+  while (fifo_count_ >= 2 * block && age - target_age_ > block - rate_ / 2000.0) {
+    DropInput(block);
+    age -= static_cast<double>(block);
+    ++stale;
+    if (running) dropped_ = dropped_ + 1;
+  }
+  if (stale) {
+    Glitch();
+    Note(now, "dropped", stale * frames_);
+  }
+  if (fifo_count_ < block) {
+    // The capture packet this block needs isn't in: silence for this period. The read position stays, so the
+    // block is dropped above when its packet comes, and the latency stays as reported.
+    if (running) underruns_ = underruns_ + 1;
+    Glitch();
+    Note(now, "silence", frames_);
+    return silence();
+  }
+  last_age_ = age;
   input_age_ = input_age_ < 0 ? age : input_age_ + (age - input_age_) / 16;
-  if (target_age_ < 0 && measured_periods_ >= warmup_ / 2) {
-    warmup_age_sum_ += age;
-    ++warmup_age_count_;
-  }
   input_age_frames_ = static_cast<int>(std::lround(input_age_));
-
-  const size_t first = std::min(block, fifo_capacity_ - fifo_read_);
-  memcpy(block_.data(), &fifo_[fifo_read_ * kChannels], first * kChannels * sizeof(int16_t));
-  if (first < block) memcpy(block_.data() + first * kChannels, fifo_.data(), (block - first) * kChannels * sizeof(int16_t));
-  drop(block);
-  return block_.data();
+  delivered_ = true;
+  return take();
 }
 
-void Engine::CheckLatencies(bool running) {
-  // Both streams run off the USB clock, so their phase only moves after a glitch: look for a new phase in the
-  // seconds after one, and nowhere else (capture timestamps jitter at some sizes).
-  if (target_age_ < 0 || periods_ >= watch_until_) {
-    drift_periods_ = 0;
+// The end of an acquisition: `minimum` is the mean age of the newest full block. The first one in a session sets
+// the latency reported; after a capture restart the engine goes back to it if the streams' phase allows.
+void Engine::Acquired(double minimum) {
+  if (target_age_ < 0) {
+    // In whole frames of margin, so the age reported is the age delivered.
+    safety_frames_ = static_cast<int>(std::lround(TargetAge(minimum, frames_, rate_, safety_blocks_) - minimum));
+    target_age_ = minimum + safety_frames_;
+    reported_age_ = static_cast<int>(std::lround(target_age_));
+  } else if (minimum > target_age_ + kOffFrames) {
+    ChangeLatency(minimum, "after the capture stream restarted");
+  } else {
+    Log("input re-acquired at %.0f frames, back to %.0f", minimum, target_age_);
+  }
+  InsertSilence(static_cast<size_t>(std::max(0L, std::lround(target_age_ - minimum))));
+  input_age_ = target_age_;
+  locked_ = true;
+}
+
+// The input can't be read at the reported latency any more: the freshest it can be read at is `minimum`. Reports
+// the new latency (with the safety margin again) and asks the client to have the host reopen the device. The
+// caller moves the read position to `minimum`; this adds the margin.
+void Engine::ChangeLatency(double minimum, const char* why) {
+  safety_frames_ = static_cast<int>(std::lround(TargetAge(minimum, frames_, rate_, safety_blocks_) - minimum));
+  const double target = minimum + safety_frames_;
+  Log("input latency changed %s: %.0f -> %.0f frames; asking the host to reopen the device", why, target_age_, target);
+  target_age_ = target;
+  reported_age_ = static_cast<int>(std::lround(target));
+  latency_changes_ = latency_changes_ + 1;
+  notify_change_ = true;
+}
+
+void Engine::CheckAlignment() {
+  // Both streams run off the USB clock, so the input's age only moves after a glitch: compare it with the
+  // reported latency in the seconds after one, and nowhere else (render wake-ups jitter by up to a millisecond).
+  if (!locked_ || periods_ >= watch_until_) {
+    window_periods_ = moves_ = 0;
+    window_sum_ = 0;
+    settle_ = false;
     return;
   }
-  // The means smooth over 16 measurements; 64 periods off by more than half a millisecond is a new phase.
-  const bool off = std::abs(input_age_ - target_age_) > 24;
-  drift_periods_ = off ? drift_periods_ + 1 : 0;
-  if (drift_periods_ < 64) return;
-  drift_periods_ = 0;
-  Log("input latency moved: input age %.0f -> %.0f frames", target_age_, input_age_);
-  target_age_ = input_age_;
-  reported_age_ = static_cast<int>(std::lround(target_age_));
-  latency_changes_ = latency_changes_ + 1;
-  if (running && client_) client_->LatenciesChanged();
+  if (!delivered_) return;
+  window_sum_ += last_age_ - target_age_;
+  window_min_left_ = window_periods_ ? std::min(window_min_left_, fifo_count_) : fifo_count_;
+  if (++window_periods_ < kWindow) return;
+  const double off = window_sum_ / window_periods_;
+  const long shift = std::lround(off);
+  window_periods_ = 0;
+  window_sum_ = 0;
+  const bool settling = settle_;
+  settle_ = false;
+  if (std::abs(off) < (settling ? 1.5 : kOffFrames) || shift == 0) return;
+  if (moves_ >= kMaxMoves) {
+    if (moves_++ == kMaxMoves) Note(last_render_, "still off, left", static_cast<int>(shift));
+    return;
+  }
+  ++moves_;
+  settle_ = !settling;  // after a move of more than kOffFrames, check the result once more, to the frame
+  if (shift < 0) {
+    // Fresher than reported (the capture stream lost frames without a gap in its positions, or the phase got
+    // shorter): read further back.
+    InsertSilence(static_cast<size_t>(-shift));
+  } else if (static_cast<size_t>(shift) <= window_min_left_) {
+    // Older than reported, and the frames to read at the reported age are in in time: skip ahead.
+    DropInput(static_cast<size_t>(shift));
+  } else {
+    // Older than reported, and the input isn't in in time to read it any fresher than this.
+    DropInput(window_min_left_);
+    input_age_ -= static_cast<double>(window_min_left_);
+    const double minimum = target_age_ + off - static_cast<double>(window_min_left_);
+    ChangeLatency(minimum, "after a glitch");
+    InsertSilence(static_cast<size_t>(std::max(0L, std::lround(target_age_ - minimum))));
+    input_age_ += target_age_ - minimum;
+    return;
+  }
+  input_age_ -= static_cast<double>(shift);
+  realigns_ = realigns_ + 1;
+  Note(last_render_, "moved", static_cast<int>(shift));
+}
+
+// A glitch: compare the input's age with the reported latency for the next seconds, from the next clean window on.
+void Engine::Glitch() {
+  watch_until_ = periods_ + kWatchSeconds * rate_ / frames_;
+  window_periods_ = 0;
+  window_sum_ = 0;
 }
 
 void Engine::MeasureOutput(int64_t now) {
@@ -614,9 +754,9 @@ void Engine::MeasureOutput(int64_t now) {
 }
 
 HRESULT Engine::RenderPeriod(int64_t now) {
-  // The capture packet can complete within microseconds of the render event (slack measured down to -4 us
-  // at 144 frames). If it isn't in yet, give it up to half a millisecond before calling it an underrun.
-  if (input_primed_ && fifo_count_ < static_cast<size_t>(frames_)) {
+  // Without a margin the capture packet can complete within microseconds of the render event (slack measured
+  // down to -4 us at 144 frames). If it isn't in yet, give it up to half a millisecond before calling it an underrun.
+  if ((locked_ || input_primed_) && fifo_count_ < static_cast<size_t>(frames_)) {
     const int64_t deadline = now + kTicksPerSecond / 2000;
     while (fifo_count_ < static_cast<size_t>(frames_) && QpcNow() < deadline) {
       YieldProcessor();
@@ -629,13 +769,9 @@ HRESULT Engine::RenderPeriod(int64_t now) {
   const bool running = running_.load(std::memory_order_acquire);
   const int64_t period = static_cast<int64_t>(frames_) * kTicksPerSecond / rate_;
   if (last_render_ && now - last_render_ > period * 3 / 2) {
+    // The capture blocks of the periods missed are stale by now: TakeInput() drops them by their age.
     if (running) late_ = late_ + 1;
-    const int missed = static_cast<int>(std::lround(static_cast<double>(now - last_render_) / period)) - 1;
-    if (missed > 0) {
-      pending_skips_ += missed;
-      skip_deadline_ = periods_ + 4;
-    }
-    watch_until_ = periods_ + kWatchSeconds * rate_ / frames_;
+    Glitch();
     if (late_record_count_ < kLateRecords) {
       late_records_[late_record_count_++] = {
           now,
@@ -685,9 +821,13 @@ HRESULT Engine::RenderPeriod(int64_t now) {
   }
   hr = w_->render->ReleaseBuffer(frames_, flags);
   if (FAILED(hr)) return hr;
-  CheckLatencies(running);
+  CheckAlignment();
   written_ += frames_;
   ++measured_periods_;
+  if (notify_change_) {
+    notify_change_ = false;
+    if (client_) client_->LatencyMustChange();
+  }
   return S_OK;
 }
 

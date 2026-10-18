@@ -53,9 +53,10 @@ class Driver final : public IASIO, private Engine::Client {
   ~Driver();
 
   void Process(const int16_t* input, uint8_t* output, int frames, int64_t position, int64_t time_ns) override;
-  void LatenciesChanged() override;
+  void LatencyMustChange() override;
   void DeviceLost() override;
   bool HostSupports(long selector) const;
+  void Tell(long selector);
 
   std::atomic<ULONG> refs_{1};
   Engine engine_;
