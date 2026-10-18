@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 # The release version: the hub compares it with the tag of the latest GitHub release.
-project(mbox2 VERSION 1.0.0 LANGUAGES CXX)
+project(mbox2 VERSION 1.0.1 LANGUAGES CXX)
 
 set(MBOX2_REPOSITORY "ItsMeATaco/mbox2-mini-open-firmware" CACHE STRING "GitHub repository (owner/name) whose releases the hub updates from")
 
