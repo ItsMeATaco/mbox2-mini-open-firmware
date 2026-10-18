@@ -35,6 +35,9 @@ void audio_sof(void);                                      /* call on every USB 
 void audio_set_lock(uint8_t enabled);                       /* bring-up: 0 freezes the clock trim */
 int16_t audio_lock_u(void);                                 /* current N trim, LSB */
 int16_t audio_lock_phase(void);                             /* accumulated MCLK error, cycles */
+uint16_t audio_lock_skipped(void);                          /* impossible measurements skipped since boot (wraps) */
+int16_t audio_lock_skipped_err(void);                       /* the last one's error, MCLK cycles */
+uint8_t audio_lock_skipped_frames(void);                    /* and the frames it spanned */
 void audio_set_rate(uint8_t rate);                          /* RATE_48K / RATE_44K1: changes MCLK only */
 uint8_t audio_rate(void);
 void audio_set_dma_mode(uint8_t mode, uint8_t ring_play, uint8_t ring_rec);   /* DMA_WAB_* bits, ring sizes

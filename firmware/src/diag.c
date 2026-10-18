@@ -4,7 +4,10 @@
  *   0x40       status registers: DMACTL0 (playback), DMACTL2 (capture), OEPCNF1, OEPBSIZ1, IEPCNF2,
  *              frame number, log positions, then the number of stale endpoint-0 IN interrupts ignored
  *              since boot (main.c ep0_in_done; wraps at 100h); since v0.24 also the sample rate (Hz, hex:
- *              BB80 or AC44) and the SET_CUR rate requests refused since boot (main.c set_rate; wraps)
+ *              BB80 or AC44) and the SET_CUR rate requests refused since boot (main.c set_rate; wraps); since
+ *              v0.26 also the clock measurements skipped as impossible since boot (wraps at 10000h), the last
+ *              one's error in MCLK cycles (16-bit two's complement: CFxx is about -12288) and its frame
+ *              count (audio.c audio_sof)
  *   0x41-0x44  the last 16 setup packets, oldest first, 4 per string (diagnostic string reads excluded)
  *   0x45-0x46  at each of the last 32 SOFs: frame number (low byte), endpoint 1 X and Y count bytes
  *   0x47-0x48  the first 24 bytes of endpoint 1's X and Y buffers, read live
@@ -293,7 +296,10 @@ const uint8_t *diag_string(uint8_t index)
         put_hex(sof_head); put_char(' ');
         put_hex(n_stale); put_char(' ');
         put_hex16(audio_rate() == RATE_44K1 ? 44100 : 48000); put_char(' ');
-        put_hex(n_refused);
+        put_hex(n_refused); put_char(' ');
+        put_hex16(audio_lock_skipped()); put_char(' ');
+        put_hex16(audio_lock_skipped_err()); put_char(' ');
+        put_hex(audio_lock_skipped_frames());
         break;
     case 0x41: case 0x42: case 0x43: case 0x44:
         for (i = 0; i < 4; i++) {

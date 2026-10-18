@@ -99,9 +99,21 @@ static const __code uint8_t boot_cpt[8] = { BOOT_CPT };
  * integral / 32, natural frequency ~1 Hz, damping ~0.7. Measured before locking: the free-running clock
  * was +136 ppm (+1.67 cycles per frame) on 2026-10-16, +7 ppm (N trim +91) on 2026-10-17.
  * At 44.1 kHz a frame holds a fractional count (11289.6 at 256 fs): the expected count carries the
- * tenths from frame to frame (lock_tenths), so ten frames expect exactly 112896. */
+ * tenths from frame to frame (lock_tenths), so ten frames expect exactly 112896.
+ *
+ * At an SOF the capture register can show the new frame's count while the frame number still reads the
+ * old frame (seen 2026-10-17/18 in v0.26's skip log: +12290 cycles over 1 frame; a start that made the
+ * next 4 frames read -12287). Mostly while string 0x49 is built, Mbox Hub's once-a-second read. In v0.25
+ * such a pair taken as the start of a measurement (the restarts below) made the next measurement a whole
+ * frame short (-12288 at 48 kHz) with nothing to make up for it: the loop sped the clock up 325 ppm for
+ * 3 s, and the converters ended a frame ahead of USB. That happened every 15-80 s while a stream ran; the
+ * capture endpoint sent the extra 48 samples, and Windows queued them. Two in a row also overflowed
+ * lock_phase. So a measurement off by more than a real clock can be (LOCK_ERR_MAX) is skipped; the next
+ * SOF measures from the same start (lock_frame, lock_cap), and a bad start runs into the missed-SOF restart
+ * within 5 frames. String 0x40 shows how many were skipped. */
 #define LOCK_U_MAX 4096                     /* about +-320 ppm */
 #define LOCK_I_MAX (LOCK_U_MAX * 32L)
+#define LOCK_ERR_MAX 64                     /* MCLK cycles: a real error is a few per frame (+-320 ppm is +-4) */
 /* MCLK cycles per 1 ms frame per rate and ratio: whole cycles, and tenths */
 static const __code uint16_t mclk_nominal[2][3] = { { 12288, 18432, 24576 }, { 11289, 16934, 22579 } };
 static const __code uint8_t mclk_tenths[2][3] = { { 0, 0, 0 }, { 6, 4, 2 } };
@@ -114,6 +126,9 @@ static __data int16_t lock_phase;
 static __data int32_t lock_integral;
 static __data int16_t lock_u;
 static __data uint8_t lock_enabled;         /* 0: the trim stays frozen at its last value */
+static __data uint16_t lock_skipped;        /* measurements skipped as impossible, since boot (wraps) */
+static __data int16_t lock_skipped_err;     /* the last one's error and frame count */
+static __data uint8_t lock_skipped_frames;
 static __data uint8_t rate;                 /* RATE_48K or RATE_44K1: one clock for both directions */
 
 /* Master clock per rate and ratio: synthesizer N (600 MHz / MCLK, 6.18 fixed point) and SCLK divider
@@ -157,6 +172,7 @@ void audio_sof(void)
     uint16_t frame = (USBFNL | ((uint16_t)USBFNH << 8)) & 0x7FF;
     uint16_t cap = ACGCAPL | ((uint16_t)ACGCAPH << 8);
     uint16_t frames, nominal;
+    uint8_t tenths;
     int16_t err;
     int32_t u;
 
@@ -174,19 +190,27 @@ void audio_sof(void)
         return;
     }
     frames = (frame - lock_frame) & 0x7FF;
-    lock_frame = frame;
     if (frames == 0 || frames > 4) {                /* missed SOFs: start the measurement over */
+        lock_frame = frame;
         lock_cap = cap;
         return;
     }
     nominal = frames * mclk_nominal[rate][mclk_ratio];  /* modulo 10000h, like the capture register */
-    lock_tenths += frames * mclk_tenths[rate][mclk_ratio];
-    while (lock_tenths >= 10) {
-        lock_tenths -= 10;
+    tenths = lock_tenths + frames * mclk_tenths[rate][mclk_ratio];
+    while (tenths >= 10) {
+        tenths -= 10;
         nominal++;
     }
     err = (int16_t)(cap - lock_cap - nominal);
+    if (err > LOCK_ERR_MAX || err < -LOCK_ERR_MAX) {    /* a count from another frame: see above */
+        lock_skipped++;
+        lock_skipped_err = err;
+        lock_skipped_frames = (uint8_t)frames;
+        return;
+    }
+    lock_frame = frame;
     lock_cap = cap;
+    lock_tenths = tenths;
 
     lock_phase += err;
     if (lock_phase > 30000)
@@ -223,6 +247,21 @@ int16_t audio_lock_u(void)
 int16_t audio_lock_phase(void)
 {
     return lock_phase;
+}
+
+uint16_t audio_lock_skipped(void)
+{
+    return lock_skipped;
+}
+
+int16_t audio_lock_skipped_err(void)
+{
+    return lock_skipped_err;
+}
+
+uint8_t audio_lock_skipped_frames(void)
+{
+    return lock_skipped_frames;
 }
 
 /* Sample rate of both directions (stage 5): only the synthesizer's frequency changes. The codec port, its

@@ -16,7 +16,7 @@
 
 #define VENDOR_ID      0x1209   /* pid.codes */
 #define PRODUCT_ID     0x0001   /* pid.codes test PID, for private testing */
-#define DEVICE_RELEASE 0x0025   /* bcdDevice: open firmware v0.25 (44.1 kHz) */
+#define DEVICE_RELEASE 0x0026   /* bcdDevice: open firmware v0.26 (clock lock skips impossible counts) */
 #define RATES          2, LE24(44100), LE24(48000)  /* bSamFreqType 2: discrete rates, one clock for both (main.c) */
 #define MAX_PACKET     294      /* 49 frames x 2 channels x 3 bytes: 48 kHz plus adaptive headroom (44.1 kHz: 44-45) */
 #define REC_MAX_PACKET 196      /* 49 frames x 2 channels x 2 bytes (16-bit: see audio.c) */

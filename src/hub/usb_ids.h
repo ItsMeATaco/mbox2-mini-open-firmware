@@ -17,7 +17,7 @@ struct UsbId {
 };
 
 inline constexpr UsbId kOpenFirmwareIds[] = {
-    {0x1209, 0x0001},  // pid.codes' test PID: firmware up to v0.25
+    {0x1209, 0x0001},  // pid.codes' test PID: firmware up to v0.26
     // {0x1209, 0x4D32},  // requested from pid.codes for this project; add it once granted
 };
 
