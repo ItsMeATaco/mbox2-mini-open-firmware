@@ -18,6 +18,9 @@ endif()
 # Mbox Hub: meters, health, dropout log, analysis, ASIO settings and firmware updates (src/hub).
 add_subdirectory(src/hub)
 
+# Experimental first install on a stock Mbox 2 Mini from Windows, through Avid's own USB update (DFU) mode.
+add_subdirectory(src/firstinstall)
+
 # ASIO driver for DAWs and its test host. Needs the interface headers from Steinberg's ASIO SDK, which this
 # repository carries in third_party/asiosdk/common (GPLv3 option of the SDK's license).
 set(ASIO_SDK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/asiosdk CACHE PATH "Steinberg ASIO SDK (the folder holding common/asio.h)")

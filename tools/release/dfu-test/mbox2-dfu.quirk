@@ -1,0 +1,10 @@
+# Digidesign Mbox 2 / Mbox 2 Mini on Avid's firmware: the runtime device (0DBA:3000) has a DFU 1.0 interface
+# (download only, manifestation tolerant, 8-byte transfers) and re-enumerates as 0DBA:3001 in update mode.
+# fwupd's DFU plugin claims both through its class match; this tells it they're the same device.
+# install.sh copies this file to /var/lib/fwupd/quirks.d/ for the install and removes it afterwards.
+[USB\VID_0DBA&PID_3000]
+Name = Mbox 2
+CounterpartGuid = USB\VID_0DBA&PID_3001
+
+[USB\VID_0DBA&PID_3001]
+Name = Mbox 2 (update mode)

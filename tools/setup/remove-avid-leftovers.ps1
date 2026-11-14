@@ -2,7 +2,8 @@
 .SYNOPSIS
   Removes what Avid's Mbox 2 driver (8.0.4.354) leaves behind after "Avid Mbox 2 USB Drivers (x64)" is
   uninstalled, so Memory Integrity stops flagging dgmbx2fu.sys. Only for a Mbox running the open
-  firmware (1209:0001), which uses Windows' own drivers.
+  firmware (1209:0001), which uses Windows' own drivers, or before installing it without wires
+  (mbox2-firstinstall.exe): then run it with the Mbox unplugged.
 
 .DESCRIPTION
   Run from PowerShell; it asks Windows for administrator rights, lists what it found and waits for

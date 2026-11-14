@@ -21,6 +21,7 @@
 /src/*
 !/src/hub/
 !/src/asio/
+!/src/firstinstall/
 
 /tools/*
 !/tools/firmware/
